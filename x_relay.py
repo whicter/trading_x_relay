@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from classifier import classify_post
+from classifier import Classification, classify_post
 from store import PostStore
 
 BASE = Path(__file__).resolve().parent
@@ -173,6 +173,11 @@ def write_heartbeat(ok: bool, detail: dict):
 # 微数据抽取：schema.org 结构化字段，比 React 的 data-testid 稳定得多。
 # 注意 author 块里也有 identifier/image/url 等同名 itemprop，必须排除
 # （closest('[itemprop="author"]')），否则会把作者 id 当帖子 id。
+# 两种页面形态都要支持：
+#   · 未登录 = 降级渲染 + schema.org 微数据（干净，但每页只有约 5 条、不能下滑）
+#   · 已登录 = React DOM（data-testid），**支持无限下滑** → 才能做到"补齐上次
+#     之后的全部帖子"。登录态由用户人工建立（--login），凭据不经过本程序。
+# 优先读微数据；读不到再走 data-testid。两条路产出同一份归一化字段。
 _EXTRACT_JS = """
 () => Array.from(document.querySelectorAll('article')).map(a => {
   const own = (prop) => Array.from(a.querySelectorAll(`[itemprop="${prop}"]`))
@@ -180,33 +185,71 @@ _EXTRACT_JS = """
   const one = (prop) => { const e = own(prop)[0];
       return e ? (e.getAttribute('content') || e.textContent) : null; };
   const authorEl = a.querySelector('[itemprop="author"] [itemprop="alternateName"]');
-  return {
-    post_id: one('identifier'),
-    published_at: one('datePublished'),
-    text: one('articleBody'),
-    author: authorEl ? authorEl.getAttribute('content') : null,
-    n_images: own('image').length +
-      a.querySelectorAll('[itemtype*="ImageObject"]').length,
-    head: (a.innerText || '').slice(0, 40),
-  };
+  let post_id = one('identifier');
+  let published_at = one('datePublished');
+  let text = one('articleBody');
+  let author = authorEl ? authorEl.getAttribute('content') : null;
+  let n_images = own('image').length +
+      a.querySelectorAll('[itemtype*="ImageObject"]').length;
+  let mode = 'microdata';
+  if (!post_id) {                      // 登录态：React DOM
+    mode = 'testid';
+    const link = a.querySelector('a[href*="/status/"]');
+    if (link) {
+      const parts = (link.getAttribute('href') || '').split('/').filter(Boolean);
+      const i = parts.indexOf('status');
+      if (i > 0) { author = parts[0]; post_id = (parts[i+1] || '').split('?')[0]; }
+    }
+    const t = a.querySelector('time');
+    published_at = t ? t.getAttribute('datetime') : null;
+    const tt = a.querySelector('[data-testid="tweetText"]');
+    text = tt ? tt.innerText : '';
+    n_images = a.querySelectorAll('[data-testid="tweetPhoto"]').length;
+  }
+  return {post_id, published_at, text, author, n_images, mode,
+          head: (a.innerText || '').slice(0, 40)};
 })
 """
+
+# 下滑抓取的上限：登录态下每次最多翻这么多屏去补历史。设上限是为了
+# "抓不完必须显式告警"而不是无限翻——真出现超过这个量的缺口，那是人要知道的事。
+MAX_SCROLLS = 25
+# 首次抓某账号（无基准线）时刻意**少翻**：中继要的是"从现在起不漏"，
+# 不是把人家几年的历史全搬回来。翻几屏拿到近期上下文即可。
+BOOTSTRAP_MAX_SCROLLS = 3
+SCROLL_WAIT_MS = 1500
 
 
 class StructureError(RuntimeError):
     """页面拿不到任何微数据——X 改版或被拦，必须显式告警而不是当成"没有新帖"。"""
 
 
-def extract_posts(page, handle: str) -> list:
-    """从已加载的（未登录）账号页提取帖子，按 post_id 去重。
+def _snowflake(post_id) -> int:
+    """post_id 转整数用于新旧比较。X 的 id 是雪花号，**全局单调递增**——
+    同一账号内 id 大 = 发得晚，这是"抓到上次那条就可以停"的判据。"""
+    try:
+        return int(post_id)
+    except (TypeError, ValueError):
+        return -1
+
+
+def extract_posts(page, handle: str, rows=None) -> list:
+    """把页面上的 article 归一化成帖子记录，按 post_id 去重。
 
     同一条帖会出现在多个 <article>（thread 分组会把父帖重复渲染），
-    去重键是微数据的 identifier。"""
-    rows = page.evaluate(_EXTRACT_JS)
+    去重键是 post_id。`rows` 用于传入已抓取的原始行（下滑累积时复用）。"""
+    rows = page.evaluate(_EXTRACT_JS) if rows is None else rows
     out, seen = [], set()
     for r in rows:
         pid = r.get("post_id")
         if not pid or pid in seen:
+            continue
+        # 只有 id、没有时间戳 = article 还没 hydrate 完（下滑时常见）。
+        # 收下它有两重害处：① 台账里多出无正文无时间的空壳行
+        # ② 若它恰好在页面顶部，会成为增量基准线，而它的内容我们从没拿到过
+        #    —— 之后永远不会再抓它，真漏帖也发现不了。
+        # 2026-08-07 实测：一轮下滑抓进 10 条这样的空壳。
+        if not r.get("published_at"):
             continue
         seen.add(pid)
         author = r.get("author") or handle
@@ -221,12 +264,22 @@ def extract_posts(page, handle: str) -> list:
             # 未登录页无 socialContext；转发的 author 与 handle 不同即可判定
             "is_retweet": author.casefold() != handle.casefold(),
             "is_pinned": ("Pinned" in head or "置顶" in head),
+            "mode": r.get("mode"),          # microdata=未登录 / testid=已登录
         })
     return out
 
 
-def fetch_account(ctx, acct: Account) -> list:
-    """抓一个账号页。拿不到任何微数据 → StructureError；其余异常向上抛。"""
+def fetch_account(ctx, acct: Account, since_id: str | None = None) -> tuple:
+    """抓一个账号，**尽量把 since_id 之后的帖子全部取回**。
+
+    返回 `(posts, complete)`：
+      · posts    —— 本次看到的全部帖子（含已见过的，去重交给 store）
+      · complete —— 是否**证明**没有遗漏。判据只有一个：本次抓到的最旧一条
+                    id ≤ since_id，说明新旧两次的窗口重叠上了，中间不可能有洞。
+
+    下滑只在登录态有效（未登录页固定约 5 条、滚动不加载）。因此未登录时
+    complete 常为 False——那不是 bug，是如实报告"我不能证明没漏"。
+    拿不到任何 article → StructureError。"""
     page = ctx.new_page()
     try:
         page.goto(f"https://x.com/{acct.handle}", timeout=45_000,
@@ -234,15 +287,43 @@ def fetch_account(ctx, acct: Account) -> list:
         try:
             # state="attached" 是必须的：微数据是隐藏的 <meta>，默认的
             # "visible" 永远等不到（2026-08-06 实测把整轮抓取判成结构失效）
-            page.wait_for_selector('article [itemprop="identifier"]',
-                                   state="attached", timeout=25_000)
+            page.wait_for_selector(
+                'article [itemprop="identifier"], article[data-testid="tweet"]',
+                state="attached", timeout=25_000)
         except Exception:                                     # noqa: BLE001
             raise StructureError(acct.handle)
         page.wait_for_timeout(1200)                           # 让剩余 article 渲染完
-        posts = extract_posts(page, acct.handle)
+
+        since = _snowflake(since_id) if since_id else -1
+        rows, seen_ids, complete = [], set(), since < 0   # 没有基准线时无需证明
+        budget = MAX_SCROLLS if since >= 0 else BOOTSTRAP_MAX_SCROLLS
+        last_count = -1
+        for attempt in range(budget + 1):
+            for r in page.evaluate(_EXTRACT_JS):
+                pid = r.get("post_id")
+                if pid and pid not in seen_ids:
+                    seen_ids.add(pid)
+                    rows.append(r)
+            # 置顶帖是很旧的一条、且永远在最上面，会让"最旧 id"永远看着已覆盖 →
+            # 判断重叠必须排除它，否则第一屏就假装"抓全了"
+            fresh = [r for r in rows
+                     if not ("Pinned" in (r.get("head") or "")
+                             or "置顶" in (r.get("head") or ""))]
+            if since >= 0 and fresh and min(_snowflake(r["post_id"]) for r in fresh) <= since:
+                complete = True
+                break
+            if len(rows) == last_count:                       # 下滑不再产出新内容
+                break
+            if attempt == budget:                             # 预算用尽，别再翻
+                break
+            last_count = len(rows)
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            page.wait_for_timeout(SCROLL_WAIT_MS)
+
+        posts = extract_posts(page, acct.handle, rows=rows)
         if not posts:
             raise StructureError(acct.handle)
-        return posts
+        return posts, complete
     finally:
         page.close()
 
@@ -291,8 +372,8 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
     from playwright.sync_api import sync_playwright
 
     now_utc = datetime.now(timezone.utc)
-    result = {"ok": [], "fail": [], "structure_fail": [], "saturated": [],
-              "new": 0, "pushed": 0}
+    result = {"ok": [], "fail": [], "structure_fail": [], "gap": [],
+              "new": 0, "pushed": 0, "logged_in": None}
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=True,
@@ -301,9 +382,10 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
         try:
             for acct in ACCOUNTS:
                 ts = datetime.now(timezone.utc).isoformat()
-                seen_before = store.has_handle(acct.handle)   # 首轮不算窗口打满
+                # 增量基准线：上次抓到的最新一条。下滑抓到它就证明没漏。
+                since_id = store.newest_post_id(acct.handle)
                 try:
-                    posts = fetch_account(ctx, acct)
+                    posts, complete = fetch_account(ctx, acct, since_id=since_id)
                 except StructureError:
                     result["structure_fail"].append(acct.handle)
                     store.record_fetch(ts, acct.handle, 0, 0, False, "structure")
@@ -322,49 +404,65 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                     post["fetched_at"] = ts
                     post["classification"] = cls.label
                     post["levels"] = cls.levels
+                    # dry-run **绝不写库**：否则它会把帖子标成"已见过"，
+                    # 真正的循环之后就再也不会推它们——预览把真实推送吞掉。
+                    # （2026-08-07 实测踩到：一次 --dry-run 吃掉了 10 条新帖。）
+                    if dry_run:
+                        if store.has_post(post["post_id"]):
+                            continue
+                        n_new += 1
+                        if should_push(post, cls, now_utc):
+                            log(f"—— dry-run 应推送 ——\n{format_push(post, cls)}")
+                        continue
                     if not store.insert_post(post):
                         continue                              # 已见过（含置顶重复）
                     n_new += 1
                     if should_push(post, cls, now_utc):
                         msg = format_push(post, cls)
-                        if dry_run:
-                            log(f"—— dry-run 应推送 ——\n{msg}")
-                        elif tg_send(msg):
+                        if tg_send(msg):
                             store.mark_pushed(
                                 post["post_id"],
                                 datetime.now(timezone.utc).isoformat())
                             result["pushed"] += 1
-                # 免登录页每轮只给约 5 条最新帖、无法下滑加载更多：若整页全是
-                # 新帖，说明窗口被填满，两轮之间很可能有帖子滑出去了 → 显式记录。
-                # 首次见到该账号时整页必然全新，那是 bootstrap 不是漏帖。
-                if seen_before and n_new >= len(posts) and len(posts) >= 3:
-                    result["saturated"].append(acct.handle)
+                # 缺口判定（取代早先那个"整页全新"的粗略启发式）：只有当本轮
+                # 抓到的最旧一条 ≤ 上次的最新一条，两次窗口才算重叠、才**证明**
+                # 没漏。证明不了就记为 gap——未登录态因为翻不动页，几乎必然如此。
+                if since_id and not complete:
+                    result["gap"].append(acct.handle)
                 result["ok"].append(acct.handle)
                 result["new"] += n_new
-                store.record_fetch(ts, acct.handle, len(posts), n_new, True)
+                if result["logged_in"] is None:
+                    result["logged_in"] = any(p.get("mode") == "testid"
+                                              for p in posts)
+                if not dry_run:
+                    store.record_fetch(ts, acct.handle, len(posts), n_new, True)
                 log(f"@{acct.handle}: 看到 {len(posts)} 条，新 {n_new} 条"
-                    f"{' [窗口打满·可能漏帖]' if acct.handle in result['saturated'] else ''}")
+                    f"{'' if not since_id else (' [已证明无遗漏]' if complete else ' [无法证明无遗漏]')}")
                 time.sleep(random.uniform(*PER_ACCOUNT_DELAY))
         finally:
             ctx.close()
 
     if result["structure_fail"] and not result["ok"]:
         alert_once("structure",
-                   "⚠️ [X中继] 所有账号都拿不到微数据，抓取停摆。\n"
-                   "多半是 X 改版或被反爬拦截，需人工看 "
-                   "`x_relay.py --once --dry-run` 的输出并修解析。",
+                   "⚠️ [X中继] 所有账号都拿不到帖子，抓取停摆。\n"
+                   "多半是 X 改版、被反爬拦截，或登录态失效，需人工看 "
+                   "`x_relay.py --once --dry-run` 的输出。",
                    STRUCTURE_ALERT_COOLDOWN)
-    if result["saturated"]:
-        alert_once("saturated_" + ",".join(sorted(result["saturated"])),
-                   "ℹ️ [X中继] 这些账号本轮抓到的帖子全是新的，说明发帖速度可能"
-                   f"超过轮询窗口、存在漏帖：{', '.join(result['saturated'])}\n"
-                   f"（当前 {POLL_SECONDS // 60} 分钟一轮，免登录页每轮约 5 条上限）",
-                   12 * 3600)
+    # 未登录态每轮固定约 5 条、翻不动页，几乎每轮都证明不了无遗漏——那种情况
+    # 每轮告警等于噪音，只在**登录态下**仍证明不了时才报（那才是真异常：
+    # 要么帖子多到翻 25 屏还没接上，要么登录态掉了）。
+    if result["gap"] and result["logged_in"]:
+        alert_once("gap_" + ",".join(sorted(result["gap"])),
+                   "⚠️ [X中继] 这些账号翻了 "
+                   f"{MAX_SCROLLS} 屏仍未接上上次的最新一条，**可能漏帖**："
+                   f"{', '.join(result['gap'])}\n"
+                   "要么发帖量暴增，要么登录态掉了导致翻页失效。",
+                   6 * 3600)
     write_heartbeat(
         ok=bool(result["ok"]),
         detail={"accounts_ok": result["ok"], "accounts_fail": result["fail"],
                 "structure_fail": result["structure_fail"],
-                "saturated": result["saturated"],
+                "gap": result["gap"], "logged_in": result["logged_in"],
                 "new_posts": result["new"], "pushed": result["pushed"]})
     return result
 
@@ -393,6 +491,82 @@ def run_loop(store: PostStore):
         time.sleep(POLL_SECONDS + random.uniform(-JITTER_SECONDS, JITTER_SECONDS))
 
 
+def do_login() -> int:
+    """打开有头浏览器，**由用户本人**登录 x.com；会话存进持久化 profile。
+
+    铁律：Claude 不代输任何凭据——密码只由用户自己敲进浏览器窗口。
+    本程序全程不接收、不存储、不日志任何用户名或密码；它只是把浏览器
+    开出来，登录完成后 profile 里留下的 cookie 由 Chromium 自己管理。
+
+    登录的唯一目的：未登录页每次只给约 5 条且**下滑不加载更多**，
+    做不到"补齐上次之后的全部帖子"。登录态的时间线支持无限下滑。
+    代价（用户已知悉）：抓取行为绑定到真实账号，X 的 ToS 风险由此产生。"""
+    from playwright.sync_api import sync_playwright
+    print("即将打开浏览器窗口。请**你自己**在窗口里登录 x.com。")
+    print("（本程序不接收密码；我也不会代你输入。）")
+    with sync_playwright() as p:
+        ctx = p.chromium.launch_persistent_context(
+            str(PROFILE_DIR), headless=False,
+            viewport={"width": 1280, "height": 900},
+            args=["--disable-blink-features=AutomationControlled"])
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        page.goto("https://x.com/login")
+        input("登录完成后回到这里按 Enter 验证并保存会话 … ")
+        # 验证：登录态的时间线是 React DOM（data-testid），未登录是降级渲染
+        ok = False
+        try:
+            page.goto("https://x.com/AdamMancini4", timeout=45_000,
+                      wait_until="domcontentloaded")
+            page.wait_for_timeout(5000)
+            ok = page.locator('article[data-testid="tweet"]').count() > 0
+        except Exception as e:                                # noqa: BLE001
+            print(f"验证时出错: {e}")
+        ctx.close()
+    if ok:
+        print(f"✅ 登录态已确认并保存到 {PROFILE_DIR}")
+        print("   之后 --once / --loop 会自动下滑补齐上次之后的全部帖子。")
+        return 0
+    print("❌ 未检测到登录态（页面仍是未登录的降级渲染）。")
+    print("   抓取仍可工作，但只能拿到每个账号最新约 5 条、无法证明不漏帖。")
+    return 1
+
+
+def push_latest(store: PostStore, per_account: int = 1, dry_run: bool = False,
+                include_filtered: bool = False) -> int:
+    """把每个账号**最新的 N 条**推一遍，绕过 12h 时效门与"已推送"标记。
+
+    存在的理由：常规路径只推「新抓到且发布未超 12h」的帖，所以刚部署完
+    群里可能长时间是空的——老帖在 bootstrap 时全被标成"已见过"，新帖又还没发。
+    那不是故障，但人看不到东西，也无从确认通道真的通。本命令用于
+    「现在就让我看到各家最新在说什么」。
+    默认只推指数类；`include_filtered=True` 连个股/其他一起推（调试分类用）。"""
+    want = None if include_filtered else sorted(PUSH_CLASSES)
+    n = 0
+    for acct in ACCOUNTS:
+        sql = ("SELECT post_id, handle, published_at, text, has_image, "
+               "classification, levels FROM posts "
+               "WHERE handle=? AND is_retweet=0 AND is_pinned=0 ")
+        params = [acct.handle]
+        if want:
+            sql += "AND classification IN (%s) " % ",".join("?" * len(want))
+            params += want
+        sql += "ORDER BY published_at DESC LIMIT ?"
+        params.append(per_account)
+        for pid, handle, pub, text, img, cls_label, lv in store.conn.execute(sql, params):
+            post = {"post_id": pid, "handle": handle, "published_at": pub,
+                    "text": text, "has_image": bool(img)}
+            cls = Classification(cls_label, json.loads(lv or "[]"), [])
+            msg = format_push(post, cls)
+            if dry_run:
+                log(f"—— dry-run 应推送 ——\n{msg}")
+                n += 1
+            elif tg_send(msg):
+                store.mark_pushed(pid, datetime.now(timezone.utc).isoformat())
+                n += 1
+                time.sleep(1.0)                               # 避开 TG 频率限制
+    return n
+
+
 def print_stats(store: PostStore):
     s = store.stats()
     print(f"台账共 {s['total']} 条")
@@ -406,15 +580,27 @@ def print_stats(store: PostStore):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
+    ap.add_argument("--login", action="store_true",
+                    help="打开浏览器由**你自己**登录 x.com（解锁下滑补齐历史）")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--push-latest", type=int, metavar="N", default=0,
+                    help="把每个账号最新 N 条推一遍（绕过 12h 时效门与已推送标记）")
+    ap.add_argument("--include-filtered", action="store_true",
+                    help="--push-latest 时连个股/其他一并推（调试分类用）")
     args = ap.parse_args()
 
+    if args.login:
+        return do_login()
     store = PostStore(DB_PATH)
     try:
-        if args.stats:
+        if args.push_latest:
+            n = push_latest(store, args.push_latest, args.dry_run,
+                            args.include_filtered)
+            log(f"最新帖推送完成：{n} 条")
+        elif args.stats:
             print_stats(store)
         elif args.once:
             r = run_once(store, dry_run=args.dry_run)

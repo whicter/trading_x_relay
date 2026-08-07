@@ -60,10 +60,30 @@ class PostStore:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def has_post(self, post_id: str) -> bool:
+        return self.conn.execute("SELECT 1 FROM posts WHERE post_id=?",
+                                 (post_id,)).fetchone() is not None
+
     def has_handle(self, handle: str) -> bool:
-        """该账号此前是否已有帖子入库——用于区分 bootstrap 与真正的窗口打满。"""
+        """该账号此前是否已有帖子入库——用于区分 bootstrap 与真正的漏帖。"""
         return self.conn.execute(
             "SELECT 1 FROM posts WHERE handle=? LIMIT 1", (handle,)).fetchone() is not None
+
+    def newest_post_id(self, handle: str) -> str | None:
+        """该账号已入库的最新一条 post_id —— 增量抓取的基准线。
+
+        按 **id 数值**排序而不是 published_at：X 的雪花号全局单调递增，是权威
+        的先后判据；published_at 是页面给的字符串，缺失或格式异常时排序会悄悄
+        错位，基准线一错就会误判"已接上"从而真漏帖。
+        置顶帖永远在页面顶部却很旧，不能当基准线，排除。
+        没有 published_at 的行同样排除——那是没 hydrate 完的空壳，
+        内容我们其实没拿到；拿它当基准线等于宣称"这条已收录"（第二道防线，
+        第一道在 extract_posts）。"""
+        row = self.conn.execute(
+            "SELECT post_id FROM posts WHERE handle=? AND is_pinned=0 "
+            "AND published_at IS NOT NULL "
+            "ORDER BY CAST(post_id AS INTEGER) DESC LIMIT 1", (handle,)).fetchone()
+        return row[0] if row else None
 
     def mark_pushed(self, post_id: str, ts: str):
         self.conn.execute("UPDATE posts SET pushed_at=? WHERE post_id=? AND pushed_at IS NULL",

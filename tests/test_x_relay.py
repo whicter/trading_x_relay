@@ -187,6 +187,14 @@ class StoreTest(unittest.TestCase):
         s.insert_post(self._post("2", has_image=True, levels=[6900.0]))
         self.assertEqual(s.stats()["image_no_levels"], 1)
 
+    def test_has_post_does_not_insert(self):
+        """dry-run 靠它判断"是不是新帖"——必须只读，不能有写副作用。"""
+        s = self._store()
+        self.assertFalse(s.has_post("1"))
+        self.assertEqual(s.stats()["total"], 0, "查询不得写库")
+        s.insert_post(self._post())
+        self.assertTrue(s.has_post("1"))
+
     def test_has_handle_gates_bootstrap(self):
         """首轮空库时整页全是新帖是必然的，不该被当成"漏帖"告警。"""
         s = self._store()
@@ -279,12 +287,144 @@ class MicrodataExtractionTest(unittest.TestCase):
         self.assertTrue(posts[0]["has_image"])
         self.assertTrue(posts[0]["is_pinned"])
 
+    def test_unhydrated_rows_are_dropped(self):
+        """有 id、无时间戳 = 下滑时抓到还没 hydrate 完的 article。
+
+        2026-08-07 实测一轮进了 10 条这种空壳。危害不止脏数据：它若在页面
+        顶部就会成为增量基准线，而其内容我们从没拿到过 → 之后永远不再抓它。"""
+        rows = [{"post_id": "123", "published_at": None, "text": "",
+                 "author": None, "n_images": 0, "head": ""},
+                {"post_id": "124", "published_at": "2026-08-06T17:08:49.000Z",
+                 "text": "ES 7751", "author": "a", "n_images": 0, "head": ""}]
+        posts = x_relay.extract_posts(self.FakePage(rows), "a")
+        self.assertEqual([p["post_id"] for p in posts], ["124"])
+
     def test_rows_without_identifier_skipped(self):
         """author 块里也有 identifier；解析若没排除 author 会串号——
         这里保证没有 post_id 的行安静跳过而不是崩。"""
         rows = [{"post_id": None, "published_at": None, "text": "",
                  "author": None, "n_images": 0, "head": ""}]
         self.assertEqual(x_relay.extract_posts(self.FakePage(rows), "h"), [])
+
+
+class IncrementalFetchTest(unittest.TestCase):
+    """「补齐上次之后的全部帖子」：靠雪花 id 单调递增 + 窗口重叠证明。"""
+
+    class FakePage:
+        """模拟下滑：每 scrollTo 一次多返回一屏，直到耗尽。"""
+
+        def __init__(self, pages):
+            self.pages, self.i, self.scrolls = pages, 0, 0
+
+        def evaluate(self, js):
+            if "scrollTo" in js:
+                self.scrolls += 1
+                self.i = min(self.i + 1, len(self.pages) - 1)
+                return None
+            return self.pages[self.i]
+
+        def wait_for_timeout(self, _ms):
+            pass
+
+        def goto(self, *a, **k):
+            pass
+
+        def wait_for_selector(self, *a, **k):
+            pass
+
+        def close(self):
+            pass
+
+    @staticmethod
+    def _row(pid, head=""):
+        return {"post_id": str(pid), "published_at": "2026-08-06T12:00:00.000Z",
+                "text": "ES 7751", "author": "AdamMancini4", "n_images": 0,
+                "mode": "testid", "head": head}
+
+    def _fetch(self, pages, since_id):
+        page = self.FakePage(pages)
+
+        class Ctx:
+            def new_page(_self):
+                return page
+        acct = x_relay.Account("AdamMancini4")
+        return x_relay.fetch_account(Ctx(), acct, since_id=since_id), page
+
+    def test_snowflake_ordering(self):
+        self.assertGreater(x_relay._snowflake("2085412793302360247"),
+                           x_relay._snowflake("2085394380060328419"))
+        self.assertEqual(x_relay._snowflake(None), -1)
+        self.assertEqual(x_relay._snowflake("not-a-number"), -1)
+
+    def test_newest_post_id_ignores_pinned(self):
+        """置顶帖永远在页面顶部却很旧——当基准线会让"已接上"永远成立、真漏帖。"""
+        s = PostStore(Path(tempfile.mkdtemp()) / "t.sqlite3")
+        base = {"handle": "a", "author": "a", "published_at": "2026-08-06T12:00:00Z",
+                "fetched_at": "2026-08-06T12:05:00Z", "text": "x",
+                "classification": "index_levels", "levels": []}
+        s.insert_post({**base, "post_id": "9999999999999999999", "is_pinned": True})
+        s.insert_post({**base, "post_id": "2085394380060328419"})
+        s.insert_post({**base, "post_id": "2085412793302360247"})
+        self.assertEqual(s.newest_post_id("a"), "2085412793302360247")
+
+    def test_newest_post_id_ignores_unhydrated_rows(self):
+        """第二道防线：空壳行即便入了库，也不得当基准线。"""
+        s = PostStore(Path(tempfile.mkdtemp()) / "t.sqlite3")
+        base = {"handle": "a", "author": "a", "fetched_at": "2026-08-06T12:05:00Z",
+                "text": "x", "classification": "other", "levels": []}
+        s.insert_post({**base, "post_id": "2085412793302360247",
+                       "published_at": "2026-08-06T12:00:00Z"})
+        s.insert_post({**base, "post_id": "2085999999999999999",
+                       "published_at": None})            # id 更大的空壳
+        self.assertEqual(s.newest_post_id("a"), "2085412793302360247")
+
+    def test_newest_post_id_sorts_numerically_not_lexically(self):
+        """字符串排序会把 "999" 排到 "2085…" 之后——必须按数值。"""
+        s = PostStore(Path(tempfile.mkdtemp()) / "t.sqlite3")
+        base = {"handle": "a", "author": "a", "published_at": "2026-08-06T12:00:00Z",
+                "fetched_at": "2026-08-06T12:05:00Z", "text": "x",
+                "classification": "other", "levels": []}
+        s.insert_post({**base, "post_id": "999"})
+        s.insert_post({**base, "post_id": "2085412793302360247"})
+        self.assertEqual(s.newest_post_id("a"), "2085412793302360247")
+
+    def test_stops_as_soon_as_overlap_proven(self):
+        """抓到上次那条即停——不做无谓翻页。"""
+        pages = [[self._row(30), self._row(29)],
+                 [self._row(30), self._row(29), self._row(28), self._row(27)]]
+        (posts, complete), page = self._fetch(pages, since_id="28")
+        self.assertTrue(complete)
+        self.assertEqual(page.scrolls, 1, "接上后应立即停止下滑")
+        self.assertIn("27", {p["post_id"] for p in posts})
+
+    def test_reports_incomplete_when_never_reaches_baseline(self):
+        """翻到底仍没接上 → 必须如实报 complete=False（未登录态的常态）。"""
+        (_, complete), _ = self._fetch([[self._row(50), self._row(49)]],
+                                       since_id="10")
+        self.assertFalse(complete, "证明不了没漏，就不能说没漏")
+
+    def test_pinned_post_cannot_fake_overlap(self):
+        """第一屏就带着很旧的置顶帖——不能据此判定"已接上"。"""
+        pages = [[self._row(50), self._row(1, head="Pinned\nAdam")],
+                 [self._row(50), self._row(1, head="Pinned\nAdam"), self._row(49)]]
+        (_, complete), _ = self._fetch(pages, since_id="10")
+        self.assertFalse(complete, "置顶帖 id 很旧，不能当窗口重叠的证据")
+
+    def test_no_baseline_means_bootstrap_not_gap(self):
+        """首次抓某账号没有基准线：不报缺口，且**刻意少翻**（不搬全部历史）。"""
+        pages = [[self._row(50 - i) for i in range(n)] for n in range(1, 40)]
+        (_, complete), page = self._fetch(pages, since_id=None)
+        self.assertTrue(complete, "没有基准线时无从证伪，不该记成漏帖")
+        self.assertLessEqual(page.scrolls, x_relay.BOOTSTRAP_MAX_SCROLLS,
+                             "首抓不该把人家几年的历史全搬回来")
+
+    def test_incremental_scrolls_deeper_than_bootstrap(self):
+        """有基准线时预算更大——那才是"补齐上次之后全部"要用的深度。"""
+        pages = [[self._row(500 - i) for i in range(n)] for n in range(1, 40)]
+        (_, complete), page = self._fetch(pages, since_id="1")
+        self.assertFalse(complete)
+        self.assertGreater(page.scrolls, x_relay.BOOTSTRAP_MAX_SCROLLS)
+        self.assertLessEqual(page.scrolls, x_relay.MAX_SCROLLS)
 
 
 class NeverTradesTest(unittest.TestCase):
