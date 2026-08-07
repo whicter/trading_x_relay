@@ -34,6 +34,7 @@ import json
 import os
 import random
 import sys
+import tempfile
 import time
 import urllib.parse
 import urllib.request
@@ -48,8 +49,17 @@ from store import PostStore
 BASE = Path(__file__).resolve().parent
 PROFILE_DIR = BASE / "runtime" / "x_profile"     # 只用于保留 guest cookie，无凭据
 DB_PATH = BASE / "runtime" / "x_posts.sqlite3"
-HEARTBEAT = BASE / "runtime" / "heartbeat.json"
 ALERT_STATE = BASE / "runtime" / "alert_state.json"
+
+# 心跳写进**主仓库**的心跳目录，文件名 = pm2 进程名，这样
+# quantrift_index_future/health_watchdog.py 才监控得到（CLAUDE.md 规则 2：
+# 不登记 = watchdog 完全不监控它，进程挂掉没有任何人知道）。
+# 格式与 heartbeat.py::write_heartbeat 一致：{name, ts, connected, ...extra}。
+# 不 import 主仓库代码——两个仓库保持独立，只共享这个 JSON 约定。
+PM2_NAME = "x-levels-relay"
+HEARTBEAT_DIR = Path(os.environ.get(
+    "QR_HEARTBEAT_DIR",
+    Path.home() / "Documents/quantrift_index_future/data/runtime/heartbeat"))
 
 ET = ZoneInfo("America/New_York")
 
@@ -136,10 +146,27 @@ def alert_once(key: str, text: str, cooldown: int):
 
 
 def write_heartbeat(ok: bool, detail: dict):
-    HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
-    HEARTBEAT.write_text(json.dumps({
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "ok": ok, **detail}))
+    """原子写主仓库心跳（temp + os.replace）。写失败绝不影响抓取主流程。
+
+    `connected` 的语义（CLAUDE.md 规则 3）：本进程**不连 IB**，
+    connected = "本轮至少有一个账号抓取成功"；`orders_enabled=False` 让
+    watchdog 用只读引擎的措辞，不会报成"未连接 IB"把人带偏。"""
+    rec = {"name": PM2_NAME, "ts": time.time(), "connected": bool(ok),
+           "orders_enabled": False, **detail}
+    try:
+        HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(HEARTBEAT_DIR),
+                                   prefix=f".{PM2_NAME}.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(rec, fh)
+            os.replace(tmp, str(HEARTBEAT_DIR / f"{PM2_NAME}.json"))
+        except Exception:                                     # noqa: BLE001
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+    except Exception as e:                                    # noqa: BLE001
+        log(f"心跳写入失败（不影响抓取）: {e}")
 
 
 # ── 抓取 ────────────────────────────────────────────────────
