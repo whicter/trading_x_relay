@@ -1,4 +1,4 @@
-"""X 博主点位中继（quantrift_x_relay 独立小服务）。
+"""X 博主点位中继（trading_x_relay 独立小服务）。
 
 定位（quantrift_index_future/strategy_explore.md §A，2026-08-02 定稿；08-06 用户拍板施工）：
 **信息中继 + 决策支持，不是 alpha**。抓取指定博主的 X 帖子 → 启发式分类

@@ -1,4 +1,4 @@
-# quantrift_x_relay — X 博主点位中继
+# trading_x_relay — X 博主点位中继
 
 独立小服务（决策来源：`quantrift_index_future/strategy_explore.md` §A，2026-08-02 定稿，
 2026-08-06 用户拍板施工）。抓取指定博主的 X 帖子 → 启发式分类（指数/个股/其他）→
@@ -67,7 +67,7 @@ X 未登录时 profile 页是降级渲染，但它带 **schema.org 微数据**
 ## 使用
 
 ```bash
-cd ~/Documents/quantrift_x_relay
+cd ~/Documents/trading_x_relay
 venv/bin/python3.11 x_relay.py --once --dry-run # 抓一轮只打印（验证用）
 venv/bin/python3.11 x_relay.py --once           # 抓一轮并推送
 venv/bin/python3.11 x_relay.py --loop           # 常驻轮询（15min ± 2min）
@@ -80,7 +80,7 @@ venv/bin/python3.11 -m unittest discover -s tests   # 单测（38 例）
 ```bash
 # TG_TOKEN 从已有进程环境取，不落盘（同主仓库模式）。
 # 可选 X_RELAY_TG_CHAT_ID 指定独立 chat，缺省回落 TG_CHAT_ID。
-cd ~/Documents/quantrift_x_relay
+cd ~/Documents/trading_x_relay
 TG_TOKEN=... TG_CHAT_ID=... PATH=/opt/homebrew/bin:$PATH \
   pm2 start venv/bin/python3.11 --name x-levels-relay -- x_relay.py --loop
 pm2 save
