@@ -60,6 +60,11 @@ class PostStore:
         self.conn.commit()
         return cur.rowcount > 0
 
+    def has_handle(self, handle: str) -> bool:
+        """该账号此前是否已有帖子入库——用于区分 bootstrap 与真正的窗口打满。"""
+        return self.conn.execute(
+            "SELECT 1 FROM posts WHERE handle=? LIMIT 1", (handle,)).fetchone() is not None
+
     def mark_pushed(self, post_id: str, ts: str):
         self.conn.execute("UPDATE posts SET pushed_at=? WHERE post_id=? AND pushed_at IS NULL",
                           (ts, post_id))

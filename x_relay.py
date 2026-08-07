@@ -4,18 +4,24 @@
 **信息中继 + 决策支持，不是 alpha**。抓取指定博主的 X 帖子 → 启发式分类
 （指数分析 / 个股 / 其他）→ 全量落库（append-only）→ 只把指数类推送 Telegram。
 
+**免登录**（2026-08-06 实测确定的路线）：X 未登录时 profile 页是降级渲染，
+但它带 **schema.org 微数据**（`itemprop=identifier/datePublished/articleBody/
+author/ImageObject`）——比登录后的 React DOM（`data-testid`）更干净也更稳定，
+因为那是给搜索引擎看的结构化数据。五个账号实测均可拿到最近 1-2 天的帖子。
+好处：无凭据、无账号封禁风险、无 session 过期、无 Google/X 登录反自动化拦截。
+代价：**每账号每轮只能看到约 5 条最新帖，且不能下滑加载更多**——靠 15 分钟
+轮询覆盖；`saturation` 检测负责在可能漏帖时显式告警（见 run_once）。
+
 铁律（继承自主仓库讨论记录，不可放宽）：
 - X 内容是**不可信输入**：可推送、可入库打分，**绝不进入任何下单路径**。
   本服务不 import ib_insync、不占 clientId、不碰任何订单/仓位文件
   （tests/test_x_relay.py 的 AST 扫描强制此边界）。
-- **登录不能由 Claude 代做**：`--login` 打开有头浏览器由用户人工登录一次，
-  凭据保存在本地持久化 profile（runtime/x_profile/，不入库）。
-- **静默失败必须显性化**：登录失效/整轮零帖子必须告警，不得静默返回空。
+- **静默失败必须显性化**：页面结构失效（拿不到任何微数据）、连续整轮失败、
+  可能漏帖（saturation）都必须告警，不得静默返回空。
 - 定位是 4-8 周验证探针（回答「这些博主准不准」），不是长期管道；
   选择器脆弱是已接受的成本。
 
 用法：
-  venv/bin/python3.11 x_relay.py --login          # 一次性：人工登录
   venv/bin/python3.11 x_relay.py --once --dry-run # 抓一轮，只打印不推送
   venv/bin/python3.11 x_relay.py --once           # 抓一轮并推送
   venv/bin/python3.11 x_relay.py --loop           # 常驻轮询（pm2 用这个）
@@ -40,7 +46,7 @@ from classifier import classify_post
 from store import PostStore
 
 BASE = Path(__file__).resolve().parent
-PROFILE_DIR = BASE / "runtime" / "x_profile"
+PROFILE_DIR = BASE / "runtime" / "x_profile"     # 只用于保留 guest cookie，无凭据
 DB_PATH = BASE / "runtime" / "x_posts.sqlite3"
 HEARTBEAT = BASE / "runtime" / "heartbeat.json"
 ALERT_STATE = BASE / "runtime" / "alert_state.json"
@@ -51,7 +57,7 @@ POLL_SECONDS = 900                 # 15 分钟一轮
 JITTER_SECONDS = 120               # ±2 分钟抖动，避免完全规律的访问节奏
 PER_ACCOUNT_DELAY = (4.0, 9.0)     # 账号间随机停顿
 PUSH_MAX_AGE_HOURS = 12            # 只推这么久以内发布的帖（防首轮回填刷屏）
-LOGIN_ALERT_COOLDOWN = 6 * 3600    # 登录失效告警冷却
+STRUCTURE_ALERT_COOLDOWN = 6 * 3600   # 页面结构失效告警冷却
 ALL_FAIL_ALERT_AFTER = 3           # 连续 N 轮全账号失败才告警（吸收网络抖动）
 PUSH_CLASSES = {"index_levels", "index_view"}
 
@@ -63,14 +69,23 @@ class Account:
     assume_index: bool = False     # 纯数字帖也按指数点位处理（见 classifier）
 
 
-# 名单来源：strategy_explore.md §A.4/A.12 + 用户 2026-08-06 确认
-# （Dayu 喊指数；Mancini 在 X 免费发点位；三个未知账号靠分类器自动判别形态）
+# 名单来源：strategy_explore.md §A.4/A.12。内容形态为 2026-08-06 实抓验证，
+# 不再是先验判断（A.12 三个"未知账号"的问题由此解锁）。
 ACCOUNTS = [
+    # 实测：每 1-2 小时一帖，#ES_F 完整点位（"7741 (hit), 7708 were next down"），
+    # 不是「see newsletter」钩子 —— A.12 该项验证通过
     Account("AdamMancini4", "ES 日内点位（Mancini）", assume_index=True),
-    Account("Investor_Dayu", "波浪理论，喊指数（用户确认）", assume_index=True),
-    Account("time_and_trade", "内容形态未知，由分类器判别"),
-    Account("willem82457275", "内容形态未知，由分类器判别"),
-    Account("novicetrader888", "内容形态未知，由分类器判别"),
+    # 实测：$spx/$ndx 波浪 + 明确点位与自报进出场（"short entered at 7789"）
+    Account("Investor_Dayu", "波浪理论，喊指数（用户确认 + 实测）", assume_index=True),
+    # 实测：中文指数评论，带点位（"ES 8000"、"7660 回撤到 7760"）。中文行文常
+    # 不写"纳指/标普"二字（"从我预测7660回撤到现在7760"），故也标 assume_index
+    Account("novicetrader888", "中文指数评论，含点位", assume_index=True),
+    # 实测：S&P500 自制指标，**点位在图里**，文本只有 "Updated 1-2-3-beyond"
+    # → 大概率只出 index_view。留着是为了给 A.9「有图无数字」占比提供样本
+    Account("willem82457275", "S&P500 指标图，点位多在图中"),
+    # 实测：加密代币推广（Interlink/StarX/PACT），与指数无关。
+    # 不删——留作分类器的**负样本对照**：若它的帖子出现在推送里，说明分类器漏了
+    Account("time_and_trade", "实测为加密推广，预期全部被过滤"),
 ]
 
 
@@ -128,81 +143,81 @@ def write_heartbeat(ok: bool, detail: dict):
 
 
 # ── 抓取 ────────────────────────────────────────────────────
-def looks_logged_out(page) -> bool:
-    """仅在页面拿不到正规 tweet article 时调用（实测 2026-08-06：未登录的
-    profile 页是降级渲染——裸 <article> 无 data-testid、无 <time>，并带
-    5 个指向 login 的导航链接；登录后才有 article[data-testid="tweet"]）。
-    因此「login 链接存在」在此调用前提下即可判登录墙，不会误伤正文里
-    偶然含 login 字样链接的已登录页——那种页有正规 article，根本走不到这里。"""
-    url = page.url or ""
-    if "/i/flow/login" in url or url.rstrip("/").endswith("/login"):
-        return True
-    for sel in ('[data-testid="loginButton"]', '[data-testid="login"]',
-                'a[href="/login"]', 'a[href*="login"]'):
-        try:
-            if page.locator(sel).count() > 0:
-                return True
-        except Exception:                                     # noqa: BLE001
-            continue
-    return False
+# 微数据抽取：schema.org 结构化字段，比 React 的 data-testid 稳定得多。
+# 注意 author 块里也有 identifier/image/url 等同名 itemprop，必须排除
+# （closest('[itemprop="author"]')），否则会把作者 id 当帖子 id。
+_EXTRACT_JS = """
+() => Array.from(document.querySelectorAll('article')).map(a => {
+  const own = (prop) => Array.from(a.querySelectorAll(`[itemprop="${prop}"]`))
+      .filter(e => !e.closest('[itemprop="author"]'));
+  const one = (prop) => { const e = own(prop)[0];
+      return e ? (e.getAttribute('content') || e.textContent) : null; };
+  const authorEl = a.querySelector('[itemprop="author"] [itemprop="alternateName"]');
+  return {
+    post_id: one('identifier'),
+    published_at: one('datePublished'),
+    text: one('articleBody'),
+    author: authorEl ? authorEl.getAttribute('content') : null,
+    n_images: own('image').length +
+      a.querySelectorAll('[itemtype*="ImageObject"]').length,
+    head: (a.innerText || '').slice(0, 40),
+  };
+})
+"""
+
+
+class StructureError(RuntimeError):
+    """页面拿不到任何微数据——X 改版或被拦，必须显式告警而不是当成"没有新帖"。"""
 
 
 def extract_posts(page, handle: str) -> list:
-    """从当前已加载的账号页提取帖子（不滚动之外的逻辑不放这里）。"""
-    posts = []
-    for art in page.locator('article[data-testid="tweet"]').all():
-        try:
-            link = art.locator('a[href*="/status/"]:has(time)').first
-            href = link.get_attribute("href") or ""
-            parts = href.strip("/").split("/")
-            if "status" not in parts:
-                continue
-            author = parts[0]
-            post_id = parts[parts.index("status") + 1].split("?")[0]
-            t = art.locator("time").first.get_attribute("datetime")
-            txt_loc = art.locator('[data-testid="tweetText"]')
-            text = txt_loc.first.inner_text() if txt_loc.count() else ""
-            social = art.locator('[data-testid="socialContext"]')
-            social_txt = social.first.inner_text() if social.count() else ""
-            posts.append({
-                "post_id": post_id,
-                "handle": handle,
-                "author": author,
-                "published_at": t,
-                "text": text,
-                "has_image": art.locator('[data-testid="tweetPhoto"]').count() > 0,
-                "is_retweet": (author.lower() != handle.lower()
-                               or "repost" in social_txt.lower()
-                               or "转推" in social_txt),
-                "is_pinned": ("pin" in social_txt.lower() or "置顶" in social_txt),
-            })
-        except Exception as e:                                # noqa: BLE001
-            log(f"  单条解析失败（跳过）: {e}")
-    return posts
+    """从已加载的（未登录）账号页提取帖子，按 post_id 去重。
+
+    同一条帖会出现在多个 <article>（thread 分组会把父帖重复渲染），
+    去重键是微数据的 identifier。"""
+    rows = page.evaluate(_EXTRACT_JS)
+    out, seen = [], set()
+    for r in rows:
+        pid = r.get("post_id")
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        author = r.get("author") or handle
+        head = (r.get("head") or "")
+        out.append({
+            "post_id": pid,
+            "handle": handle,
+            "author": author,
+            "published_at": r.get("published_at"),
+            "text": r.get("text") or "",
+            "has_image": bool(r.get("n_images")),
+            # 未登录页无 socialContext；转发的 author 与 handle 不同即可判定
+            "is_retweet": author.casefold() != handle.casefold(),
+            "is_pinned": ("Pinned" in head or "置顶" in head),
+        })
+    return out
 
 
 def fetch_account(ctx, acct: Account) -> list:
-    """抓一个账号页；登录失效抛 LoginWallError，其余异常向上抛。"""
+    """抓一个账号页。拿不到任何微数据 → StructureError；其余异常向上抛。"""
     page = ctx.new_page()
     try:
         page.goto(f"https://x.com/{acct.handle}", timeout=45_000,
                   wait_until="domcontentloaded")
         try:
-            page.wait_for_selector('article[data-testid="tweet"]', timeout=20_000)
+            # state="attached" 是必须的：微数据是隐藏的 <meta>，默认的
+            # "visible" 永远等不到（2026-08-06 实测把整轮抓取判成结构失效）
+            page.wait_for_selector('article [itemprop="identifier"]',
+                                   state="attached", timeout=25_000)
         except Exception:                                     # noqa: BLE001
-            # 正规 tweet article 拿不到才需要区分：登录墙 vs 其他故障
-            if looks_logged_out(page):
-                raise LoginWallError(acct.handle)
-            raise
-        page.mouse.wheel(0, 2500)                             # 多拿一屏
-        page.wait_for_timeout(1500)
-        return extract_posts(page, acct.handle)
+            raise StructureError(acct.handle)
+        page.wait_for_timeout(1200)                           # 让剩余 article 渲染完
+        posts = extract_posts(page, acct.handle)
+        if not posts:
+            raise StructureError(acct.handle)
+        return posts
     finally:
         page.close()
-
-
-class LoginWallError(RuntimeError):
-    pass
 
 
 # ── 推送格式 ────────────────────────────────────────────────
@@ -249,22 +264,24 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
     from playwright.sync_api import sync_playwright
 
     now_utc = datetime.now(timezone.utc)
-    result = {"ok": [], "fail": [], "login_wall": False, "new": 0, "pushed": 0}
+    result = {"ok": [], "fail": [], "structure_fail": [], "saturated": [],
+              "new": 0, "pushed": 0}
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
             str(PROFILE_DIR), headless=True,
-            viewport={"width": 1280, "height": 1600},
+            viewport={"width": 1280, "height": 2200},
             args=["--disable-blink-features=AutomationControlled"])
         try:
             for acct in ACCOUNTS:
                 ts = datetime.now(timezone.utc).isoformat()
+                seen_before = store.has_handle(acct.handle)   # 首轮不算窗口打满
                 try:
                     posts = fetch_account(ctx, acct)
-                except LoginWallError:
-                    result["login_wall"] = True
-                    store.record_fetch(ts, acct.handle, 0, 0, False, "login_wall")
-                    log(f"@{acct.handle}: 登录墙！")
-                    break                                     # 登录失效对所有账号成立
+                except StructureError:
+                    result["structure_fail"].append(acct.handle)
+                    store.record_fetch(ts, acct.handle, 0, 0, False, "structure")
+                    log(f"@{acct.handle}: 拿不到微数据（页面结构失效或被拦）")
+                    continue
                 except Exception as e:                        # noqa: BLE001
                     result["fail"].append(acct.handle)
                     store.record_fetch(ts, acct.handle, 0, 0, False, str(e)[:200])
@@ -290,23 +307,37 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                                 post["post_id"],
                                 datetime.now(timezone.utc).isoformat())
                             result["pushed"] += 1
+                # 免登录页每轮只给约 5 条最新帖、无法下滑加载更多：若整页全是
+                # 新帖，说明窗口被填满，两轮之间很可能有帖子滑出去了 → 显式记录。
+                # 首次见到该账号时整页必然全新，那是 bootstrap 不是漏帖。
+                if seen_before and n_new >= len(posts) and len(posts) >= 3:
+                    result["saturated"].append(acct.handle)
                 result["ok"].append(acct.handle)
                 result["new"] += n_new
                 store.record_fetch(ts, acct.handle, len(posts), n_new, True)
-                log(f"@{acct.handle}: 看到 {len(posts)} 条，新 {n_new} 条")
+                log(f"@{acct.handle}: 看到 {len(posts)} 条，新 {n_new} 条"
+                    f"{' [窗口打满·可能漏帖]' if acct.handle in result['saturated'] else ''}")
                 time.sleep(random.uniform(*PER_ACCOUNT_DELAY))
         finally:
             ctx.close()
 
-    if result["login_wall"]:
-        alert_once("login_wall",
-                   "⚠️ [X中继] 登录已失效，抓取停摆。请在 Mac Studio 上执行:\n"
-                   "cd ~/Documents/quantrift_x_relay && venv/bin/python3.11 x_relay.py --login",
-                   LOGIN_ALERT_COOLDOWN)
+    if result["structure_fail"] and not result["ok"]:
+        alert_once("structure",
+                   "⚠️ [X中继] 所有账号都拿不到微数据，抓取停摆。\n"
+                   "多半是 X 改版或被反爬拦截，需人工看 "
+                   "`x_relay.py --once --dry-run` 的输出并修解析。",
+                   STRUCTURE_ALERT_COOLDOWN)
+    if result["saturated"]:
+        alert_once("saturated_" + ",".join(sorted(result["saturated"])),
+                   "ℹ️ [X中继] 这些账号本轮抓到的帖子全是新的，说明发帖速度可能"
+                   f"超过轮询窗口、存在漏帖：{', '.join(result['saturated'])}\n"
+                   f"（当前 {POLL_SECONDS // 60} 分钟一轮，免登录页每轮约 5 条上限）",
+                   12 * 3600)
     write_heartbeat(
-        ok=not result["login_wall"] and bool(result["ok"]),
+        ok=bool(result["ok"]),
         detail={"accounts_ok": result["ok"], "accounts_fail": result["fail"],
-                "login_wall": result["login_wall"],
+                "structure_fail": result["structure_fail"],
+                "saturated": result["saturated"],
                 "new_posts": result["new"], "pushed": result["pushed"]})
     return result
 
@@ -318,7 +349,7 @@ def run_loop(store: PostStore):
     while True:
         try:
             r = run_once(store)
-            if r["login_wall"]:
+            if r["structure_fail"] and not r["ok"]:
                 consecutive_all_fail = 0                      # 已单独告警
             elif not r["ok"]:
                 consecutive_all_fail += 1
@@ -335,21 +366,6 @@ def run_loop(store: PostStore):
         time.sleep(POLL_SECONDS + random.uniform(-JITTER_SECONDS, JITTER_SECONDS))
 
 
-def do_login():
-    """有头浏览器 + 持久化 profile，登录由用户人工完成（铁律：Claude 不代输密码）。"""
-    from playwright.sync_api import sync_playwright
-    print("将打开浏览器窗口，请人工登录 x.com。登录完成后回到终端按 Enter。")
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=False,
-            viewport={"width": 1280, "height": 900})
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto("https://x.com/login")
-        input("登录完成后按 Enter 关闭浏览器并保存会话 … ")
-        ctx.close()
-    print(f"会话已保存到 {PROFILE_DIR}")
-
-
 def print_stats(store: PostStore):
     s = store.stats()
     print(f"台账共 {s['total']} 条")
@@ -363,25 +379,21 @@ def print_stats(store: PostStore):
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--login", action="store_true")
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--loop", action="store_true")
     ap.add_argument("--stats", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    if args.login:
-        do_login()
-        return 0
     store = PostStore(DB_PATH)
     try:
         if args.stats:
             print_stats(store)
         elif args.once:
             r = run_once(store, dry_run=args.dry_run)
-            log(f"完成：ok={r['ok']} fail={r['fail']} 新帖 {r['new']} 推送 {r['pushed']}"
-                f"{' [登录墙]' if r['login_wall'] else ''}")
-            return 2 if r["login_wall"] else 0
+            log(f"完成：ok={r['ok']} fail={r['fail']} "
+                f"结构失效={r['structure_fail']} 新帖 {r['new']} 推送 {r['pushed']}")
+            return 0 if r["ok"] else 2
         elif args.loop:
             run_loop(store)
         else:

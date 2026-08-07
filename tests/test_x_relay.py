@@ -17,11 +17,52 @@ import x_relay                                               # noqa: E402
 
 
 class ClassifierIndexTest(unittest.TestCase):
+    """样本取自 2026-08-06 五个账号的**真实抓取内容**，不是编的。"""
+
     def test_mancini_style_es_levels(self):
         c = classify_post("ES recovered 6900. Bulls need to hold 6885, "
                           "below that 6862 then 6841.")
         self.assertEqual(c.label, "index_levels")
         self.assertEqual(c.levels, [6900.0, 6885.0, 6862.0, 6841.0])
+
+    def test_real_mancini_post(self):
+        c = classify_post(
+            "No volatility in #ES_F at all and everything in slow motion today. "
+            "Price is resting after a 400+ point vertical rally from the 7325 "
+            "Failed Breakdown last Wednesday. Bulls must recover 7751 to see "
+            "7763, 7774, 7782+.\n\nNo big supports now until 7708")
+        self.assertEqual(c.label, "index_levels")
+        for lvl in (7325.0, 7751.0, 7763.0, 7774.0, 7782.0, 7708.0):
+            self.assertIn(lvl, c.levels)
+
+    def test_real_dayu_lowercase_cashtag(self):
+        """Dayu 全用小写 $spx/$ndx——大写正则抓不到，靠指数 cashtag 识别。"""
+        c = classify_post(
+            "Cashed out my $spx short entered at 7789. As in a typical wave-4 "
+            "pullback, $spx has moved down correctively. Although my ideal "
+            "target for wave-4 is 7660-7580, I am not going to risk gains.")
+        self.assertEqual(c.label, "index_levels")
+        self.assertEqual(c.levels, [7789.0, 7660.0, 7580.0])
+
+    def test_real_chinese_index_commentary(self):
+        """中文行文常不写"纳指/标普"，只有数字——靠账号级 assume_index 兜底。"""
+        c = classify_post(
+            "从我预测7660回撤到现在7760正正100点一柱擎天式样拉升，逼空是很可能的。",
+            assume_index=True)
+        self.assertEqual(c.label, "index_levels")
+        self.assertEqual(c.levels, [7660.0, 7760.0], "100 点不是点位（低于下限）")
+
+    def test_html_entity_ampersand(self):
+        """微数据里 & 是双重编码（实测 "S&amp;P 500"），不解码则关键词失效。
+        且指数名自带的 500 不是点位。"""
+        c = classify_post("Updated 1-top, 2-fail, 3-beyond S&amp;P 500. "
+                          "Wil it work properly?")
+        self.assertEqual(c.label, "index_view")
+        self.assertEqual(c.levels, [], '"S&P 500" 的 500 不是点位')
+
+    def test_index_name_numbers_are_not_levels(self):
+        c = classify_post("Russell 2000 leading while S&P 500 stalls at 7,751")
+        self.assertEqual(c.levels, [7751.0])
 
     def test_dayu_style_chinese_index(self):
         c = classify_post("纳指四浪回调目标 24,800，若跌破则看 24,350，"
@@ -53,6 +94,15 @@ class ClassifierStockTest(unittest.TestCase):
         c = classify_post("特斯拉今天的走势说明资金在出逃")
         self.assertEqual(c.label, "stock")
 
+    def test_real_crypto_shill_is_filtered(self):
+        """@time_and_trade 实测内容：加密代币推广，必须进不了推送。"""
+        c = classify_post(
+            "Interlink Network ( $ITLG, $ITL ) is different from its peers. "
+            "Interlink Network's future is very bright because the core team "
+            "is dynamic, forward looking, well planning and fast moving.")
+        self.assertEqual(c.label, "stock")
+        self.assertFalse(c.is_index)
+
     def test_mixed_post_counts_as_index(self):
         """混合帖按指数处理——宁可多推，不漏指数内容。"""
         c = classify_post("$NVDA strong but SPX rejected at 6,900 again")
@@ -76,6 +126,11 @@ class ClassifierEdgeTest(unittest.TestCase):
     def test_percent_not_a_level(self):
         c = classify_post("NQ down 350% no wait that cant be right")
         self.assertNotIn(350.0, c.levels)
+
+    def test_move_size_is_not_a_level(self):
+        """实测：Mancini "a 400+ point vertical rally" 的 400 是涨跌幅不是点位。"""
+        c = classify_post("ES rallied 400+ points off the 7325 low")
+        self.assertEqual(c.levels, [7325.0])
 
     def test_assume_index_numbers_only(self):
         """Mancini 常年不写 ES 二字只发数字——assume_index 账号纯数字帖判指数。"""
@@ -132,6 +187,14 @@ class StoreTest(unittest.TestCase):
         s.insert_post(self._post("2", has_image=True, levels=[6900.0]))
         self.assertEqual(s.stats()["image_no_levels"], 1)
 
+    def test_has_handle_gates_bootstrap(self):
+        """首轮空库时整页全是新帖是必然的，不该被当成"漏帖"告警。"""
+        s = self._store()
+        self.assertFalse(s.has_handle("a"))
+        s.insert_post(self._post())
+        self.assertTrue(s.has_handle("a"))
+        self.assertFalse(s.has_handle("b"))
+
 
 class PushGatingTest(unittest.TestCase):
     def _post(self, **kw):
@@ -167,6 +230,61 @@ class PushGatingTest(unittest.TestCase):
             self._post(has_image=True, text="levels updated 👇"),
             classify_post("levels updated 👇 nasdaq"))
         self.assertIn("帖内含图", msg)
+
+
+class MicrodataExtractionTest(unittest.TestCase):
+    """免登录微数据解析（2026-08-06 实测路线）的行为固定。"""
+
+    class FakePage:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def evaluate(self, _js):
+            return self.rows
+
+    def test_dedup_by_identifier(self):
+        """thread 分组会把同一条帖重复渲染成多个 <article>。"""
+        rows = [{"post_id": "1", "published_at": "2026-08-06T17:08:49.000Z",
+                 "text": "ES 7751", "author": "AdamMancini4", "n_images": 0,
+                 "head": ""},
+                {"post_id": "1", "published_at": "2026-08-06T17:08:49.000Z",
+                 "text": "ES 7751", "author": "AdamMancini4", "n_images": 0,
+                 "head": ""},
+                {"post_id": "2", "published_at": "2026-08-06T15:55:39.000Z",
+                 "text": "ES 7741", "author": "AdamMancini4", "n_images": 0,
+                 "head": ""}]
+        posts = x_relay.extract_posts(self.FakePage(rows), "AdamMancini4")
+        self.assertEqual([p["post_id"] for p in posts], ["1", "2"])
+
+    def test_author_case_difference_is_not_retweet(self):
+        """实测：微数据 author 是 "Time_and_Trade"，handle 是 time_and_trade。
+        大小写不同不是转发——大小写敏感比较会把本人帖全判成转发、全部不推。"""
+        rows = [{"post_id": "9", "published_at": "2026-08-06T18:43:42.000Z",
+                 "text": "x", "author": "Time_and_Trade", "n_images": 0,
+                 "head": ""}]
+        posts = x_relay.extract_posts(self.FakePage(rows), "time_and_trade")
+        self.assertFalse(posts[0]["is_retweet"])
+
+    def test_real_retweet_detected(self):
+        rows = [{"post_id": "9", "published_at": "2026-08-06T18:43:42.000Z",
+                 "text": "x", "author": "SomeoneElse", "n_images": 0, "head": ""}]
+        posts = x_relay.extract_posts(self.FakePage(rows), "time_and_trade")
+        self.assertTrue(posts[0]["is_retweet"])
+
+    def test_image_and_pinned_flags(self):
+        rows = [{"post_id": "9", "published_at": "2026-08-06T10:26:39.000Z",
+                 "text": "Updated 1-2-3", "author": "willem82457275",
+                 "n_images": 2, "head": "Pinned\nWillem"}]
+        posts = x_relay.extract_posts(self.FakePage(rows), "willem82457275")
+        self.assertTrue(posts[0]["has_image"])
+        self.assertTrue(posts[0]["is_pinned"])
+
+    def test_rows_without_identifier_skipped(self):
+        """author 块里也有 identifier；解析若没排除 author 会串号——
+        这里保证没有 post_id 的行安静跳过而不是崩。"""
+        rows = [{"post_id": None, "published_at": None, "text": "",
+                 "author": None, "n_images": 0, "head": ""}]
+        self.assertEqual(x_relay.extract_posts(self.FakePage(rows), "h"), [])
 
 
 class NeverTradesTest(unittest.TestCase):
