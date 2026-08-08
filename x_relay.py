@@ -150,6 +150,62 @@ def alert_once(key: str, text: str, cooldown: int):
         ALERT_STATE.write_text(json.dumps(state))
 
 
+EXPORT_PATH = Path.home() / "Documents/quantrift_index_future/data/runtime/x_levels_export.json"
+EXPORT_WINDOW_HOURS = 48
+
+
+def export_for_brief(store: PostStore):
+    """导出近 EXPORT_WINDOW_HOURS 的可推送帖到**主仓库**，供盘前/盘后简报只读。
+
+    跨仓库耦合的方向是刻意的：**生产者导出契约文件，消费者只读**，与本进程
+    往主仓库写 heartbeat 是同一模式。若反过来让主仓库直接读本仓库的
+    x_posts.sqlite3，耦合的就变成本仓库的内部 schema——本仓库以后想重构
+    就会静默打破简报。
+
+    导出带 generated_at，简报据此判断新鲜度；数据陈旧时简报应明说
+    「X 中继数据滞后 N 分钟」而不是静默给空（fail closed）。
+    """
+    from datetime import timedelta
+    since = (datetime.now(timezone.utc)
+             - timedelta(hours=EXPORT_WINDOW_HOURS)).isoformat().replace("+00:00", "Z")
+    rows = store.conn.execute(
+        "SELECT post_id, handle, published_at, text, classification, levels, "
+        "ticker_levels, has_image FROM posts "
+        "WHERE published_at > ? AND is_retweet=0 "
+        "ORDER BY published_at", (since,)).fetchall()
+    posts = []
+    for pid, handle, pub, text, cls, lv, tl, img in rows:
+        if cls in PUSH_BLOCKED:
+            continue
+        posts.append({
+            "post_id": pid, "handle": handle, "published_at": pub,
+            "classification": cls, "text": text,
+            "levels": json.loads(lv or "[]"),
+            "ticker_levels": json.loads(tl or "{}"),
+            "has_image": bool(img),
+            "url": f"https://x.com/{handle}/status/{pid}",
+        })
+    payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
+               "window_hours": EXPORT_WINDOW_HOURS,
+               "accounts": [a.handle for a in ACCOUNTS],
+               "posts": posts}
+    try:
+        EXPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=str(EXPORT_PATH.parent),
+                                   prefix=".x_levels_export.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, str(EXPORT_PATH))
+        except Exception:                                     # noqa: BLE001
+            if os.path.exists(tmp):
+                os.unlink(tmp)
+            raise
+        log(f"导出 {len(posts)} 条到主仓库 x_levels_export.json")
+    except Exception as e:                                    # noqa: BLE001
+        log(f"导出失败（不影响抓取）: {e}")
+
+
 def write_heartbeat(ok: bool, detail: dict):
     """原子写主仓库心跳（temp + os.replace）。写失败绝不影响抓取主流程。
 
@@ -349,7 +405,14 @@ def format_push(post: dict, cls) -> str:
     lines = [f"📡 [X·{CLASS_CN.get(cls.label, cls.label)}] @{post['handle']}{when}"]
     text = (post.get("text") or "").strip()
     lines.append(text[:900] + ("…" if len(text) > 900 else ""))
-    if cls.levels:
+    tl = getattr(cls, "ticker_levels", None) or {}
+    named = {k: v for k, v in tl.items() if k != "_lead"}
+    if named:
+        # 标的绑定优先：「$aaoi 149/160/170　$axti 89」比一串分不清归属的数字有用
+        lines.append("📍 " + "　".join(
+            f"${k} {'/'.join(f'{v:,.10g}' for v in vs[:6])}"
+            for k, vs in list(named.items())[:6]))
+    elif cls.levels:
         lines.append("📍 " + ", ".join(f"{v:,.10g}" for v in cls.levels[:12]))
     if post.get("has_image") and not cls.levels:
         lines.append("🖼 帖内含图（点位可能在图中，文本未抽出数字）")
@@ -409,6 +472,7 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                     post["fetched_at"] = ts
                     post["classification"] = cls.label
                     post["levels"] = cls.levels
+                    post["ticker_levels"] = cls.ticker_levels
                     # dry-run **绝不写库**：否则它会把帖子标成"已见过"，
                     # 真正的循环之后就再也不会推它们——预览把真实推送吞掉。
                     # （2026-08-07 实测踩到：一次 --dry-run 吃掉了 10 条新帖。）
@@ -470,6 +534,7 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                 store.bump_attempt(pid)
             time.sleep(1.0)          # 限流是丢帖主因，补发放慢
         # 重试用尽仍未送达 = 真的丢了，必须让人知道（原来是完全静默的）
+        export_for_brief(store)          # 供主仓库简报只读
         gave_up = store.give_up_count(PUSH_RETRY_MAX)
         if gave_up:
             alert_once("giveup",

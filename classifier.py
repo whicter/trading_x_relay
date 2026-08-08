@@ -116,12 +116,40 @@ _CHATTER_CN = ("不作为任何投资建议", "盈亏自负", "没有任何群�
 
 # ── 点位数字抽取 ────────────────────────────────────────────
 # 带千分位或纯数字，可带小数；排除紧邻 % / : / $ 的（百分比/时间/价格个股常用$）
-_NUMBER = re.compile(r"(?<![\d.,:%$])(\d{1,2},\d{3}(?:\.\d+)?|\d{3,5}(?:\.\d+)?)(?!\d)(?!,\d)(?!\s?%)(?!:)")
+# 2026-08-08：原来是 `\d{3,5}`（至少 3 位），因为只服务指数点位。个股点位
+# 大量是两位数甚至个位数（$arqq 19-20、$axti 89、$gdx 70），全被漏掉。
+# 放宽到 **2 位**起（不是 1 位）：实测 1 位数在这批文本里几乎全是噪音——
+# 波浪序号（"wave-3"、"5 waves"）、批次（"first tranche"）、日期（"7/23"）。
+# 两位起即可覆盖 $arqq 19-20 / $axti 89 / $gdx 70 这类真实个股点位。
+# 另加两条排除：紧邻 `/` 或 `-` 的（日期 7/23、区间连字符已由前后数字各自捕获）、
+# 前面是 wave/浪 的序号。
+_NUMBER = re.compile(
+    r"(?<![\d.,:%$/])(\d{1,2},\d{3}(?:\.\d+)?|\d{2,5}(?:\.\d+)?)"
+    r"(?!\d)(?!,\d)(?!\s?%)(?!:)(?!/\d)")
+# 波浪序号：wave-3 / wave 4 / 第3浪 / 3 waves —— 这些数字不是点位
+_WAVE_ORDINAL = re.compile(r"(?i)(wave[-\s]?\d{1,2}|\d{1,2}[-\s]?waves?|第\s?\d{1,2}\s?浪|\d{1,2}\s?浪)")
 
 # 下限 600：SPY 现价约 770，是最低的相关标的；再低的数字在指数语境下几乎
 # 都是"点数"而非"点位"（实测 Mancini "a 400+ point vertical rally" 的 400
 # 曾被抽成点位）。上限留到 60,000 覆盖 NQ ~26,000 及未来上涨。
 LEVEL_MIN, LEVEL_MAX = 600.0, 60_000.0
+
+# 2026-08-08：上面这对边界是给**指数**定的，个股/商品/加密全被它滤掉了——
+# `$arqq 19-20`、`$gdx 70`、`$aaoi 149` 一个都抽不出来，推送里只有原文没有点位。
+# 按资产类分别设区间。个股下限 1.0（仙股不看）、上限 2000（BRK 那类除外，
+# 我们名单里没有）；加密跨度最大（DOGE 0.x 到 BTC 十万级）。
+LEVEL_RANGES = {
+    "index":     (600.0, 60_000.0),
+    "stock":     (1.0, 2_000.0),
+    "commodity": (1.0, 10_000.0),      # $gdx 70 / gold 3400 / 原油 60
+    "crypto":    (0.01, 200_000.0),
+}
+
+# 标的 ↔ 点位绑定：一条帖常同时提多个标的（"$aaoi 到 149，$axti 到 89"）。
+# 只给一个扁平的 levels 列表，读的人无法知道哪个数字属于哪个标的——
+# 简报要求「看好的标的和点位都给出来」，必须绑定。
+# 做法：按 cashtag 切段，每个数字归属**它前面最近的那个 cashtag**。
+_CASHTAG_SPAN = re.compile(r"\$([A-Za-z]{1,6})\b")
 
 
 # 与交易无关、**不推送**的标签。这是全部拦截清单——其余一律推。
@@ -135,6 +163,7 @@ class Classification:
     label: str   # index_levels|index_view|commodity|crypto|stock|macro|promo|chatter|other
     levels: list = field(default_factory=list)   # 抽出的候选点位（float）
     cashtags: list = field(default_factory=list)
+    ticker_levels: dict = field(default_factory=dict)  # {TICKER: [levels]}
 
     @property
     def is_index(self) -> bool:
@@ -146,8 +175,9 @@ class Classification:
         return self.label not in PUSH_BLOCKED
 
 
-def _extract_levels(text: str) -> list:
+def _extract_levels(text: str, lo: float = LEVEL_MIN, hi: float = LEVEL_MAX) -> list:
     text = _INDEX_NAME_NUM.sub(" INDEXNAME ", text)
+    text = _WAVE_ORDINAL.sub(" WAVE ", text)      # 浪序号不是点位
     out = []
     for m in _NUMBER.finditer(text):
         raw = m.group(1).replace(",", "")
@@ -158,7 +188,7 @@ def _extract_levels(text: str) -> list:
         # 过滤年份（1900-2100 的整数几乎必是年份；现今指数点位不落在此区间）
         if v == int(v) and 1900 <= v <= 2100:
             continue
-        if LEVEL_MIN <= v <= LEVEL_MAX:
+        if lo <= v <= hi:
             out.append(v)
     # 去重保序
     seen, uniq = set(), []
@@ -167,6 +197,40 @@ def _extract_levels(text: str) -> list:
             seen.add(v)
             uniq.append(v)
     return uniq
+
+
+def extract_ticker_levels(text: str, asset: str = "stock") -> dict:
+    """把点位绑定到标的：{TICKER: [levels]}。
+
+    按 cashtag 出现位置切段，每个数字归属**它前面最近的那个 cashtag**。
+    「$aaoi has reached 149 before pulling back. $axti has reached 89」
+    → {AAOI: [149], AXTI: [89]}，而不是一个分不清归属的 [149, 89]。
+
+    第一个 cashtag 之前的数字归 `_lead`（如 "reached 133 last week, $spcx…"
+    这种倒装），调用方自行决定要不要用。
+    """
+    text = _html.unescape(text or "")
+    lo, hi = LEVEL_RANGES.get(asset, LEVEL_RANGES["stock"])
+    marks = [(m.start(), m.group(1).upper()) for m in _CASHTAG_SPAN.finditer(text)]
+    if not marks:
+        lv = _extract_levels(text, lo, hi)
+        return {"_lead": lv} if lv else {}
+    out: dict = {}
+    bounds = [(pos, tag, (marks[i + 1][0] if i + 1 < len(marks) else len(text)))
+              for i, (pos, tag) in enumerate(marks)]
+    lead = _extract_levels(text[:marks[0][0]], lo, hi)
+    if lead:
+        out["_lead"] = lead
+    for pos, tag, end in bounds:
+        if tag in _INDEX_TICKERS:
+            continue                       # 指数代码走 levels，不进个股表
+        seg = _extract_levels(text[pos:end], lo, hi)
+        if seg:
+            out.setdefault(tag, [])
+            for v in seg:
+                if v not in out[tag]:
+                    out[tag].append(v)
+    return out
 
 
 def _has_index_keyword(text: str) -> bool:
@@ -216,16 +280,20 @@ def classify_post(text: str, assume_index: bool = False) -> Classification:
 
     # 标的类：商品 > 加密 > 个股。都推，标签只为消息头可读。
     if _hit(_COMMODITY, _COMMODITY_CN, text):
-        return Classification("commodity", levels, stock)
+        return Classification("commodity", _extract_levels(text, *LEVEL_RANGES["commodity"]),
+                              stock, extract_ticker_levels(text, "commodity"))
     if _hit(_CRYPTO_MAJOR, _CRYPTO_CN, text):
         # 主流币 + 行情语义 = 观点（推）；主流币 + 产品公告 = 广告（拦）
         if _hit(_MARKET_VIEW, _MARKET_VIEW_CN, text):
-            return Classification("crypto", levels, stock)
+            return Classification("crypto", _extract_levels(text, *LEVEL_RANGES["crypto"]),
+                                  stock, extract_ticker_levels(text, "crypto"))
         if _hit(_PRODUCT_NEWS, _PRODUCT_NEWS_CN, text):
             return Classification("promo", [], stock)
-        return Classification("crypto", levels, stock)
+        return Classification("crypto", _extract_levels(text, *LEVEL_RANGES["crypto"]),
+                              stock, extract_ticker_levels(text, "crypto"))
     if stock:
-        return Classification("stock", levels, stock)
+        return Classification("stock", _extract_levels(text, *LEVEL_RANGES["stock"]),
+                              stock, extract_ticker_levels(text, "stock"))
 
     # 宏观放在标的之后：「关税打压纳指」应归指数，不是宏观
     if _hit(_MACRO, _MACRO_CN, text):

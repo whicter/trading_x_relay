@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS posts (
     is_pinned    INTEGER NOT NULL DEFAULT 0,
     classification TEXT,
     levels       TEXT,               -- JSON array
+    ticker_levels TEXT,              -- JSON {TICKER: [levels]}
     pushed_at    TEXT,               -- NULL = 未推送
     push_attempts INTEGER NOT NULL DEFAULT 0   -- 推送尝试次数（重试队列用）
 );
@@ -55,6 +56,8 @@ class PostStore:
         if "push_attempts" not in cols:
             self.conn.execute(
                 "ALTER TABLE posts ADD COLUMN push_attempts INTEGER NOT NULL DEFAULT 0")
+        if "ticker_levels" not in cols:
+            self.conn.execute("ALTER TABLE posts ADD COLUMN ticker_levels TEXT")
         self.conn.commit()
 
     def insert_post(self, post: dict) -> bool:
@@ -62,13 +65,15 @@ class PostStore:
         cur = self.conn.execute(
             """INSERT OR IGNORE INTO posts
                (post_id, handle, author, published_at, fetched_at, text,
-                has_image, is_retweet, is_pinned, classification, levels)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                has_image, is_retweet, is_pinned, classification, levels,
+                ticker_levels)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             (post["post_id"], post["handle"], post["author"],
              post.get("published_at"), post["fetched_at"], post.get("text", ""),
              int(post.get("has_image", False)), int(post.get("is_retweet", False)),
              int(post.get("is_pinned", False)), post.get("classification"),
-             json.dumps(post.get("levels", []))))
+             json.dumps(post.get("levels", [])),
+             json.dumps(post.get("ticker_levels", {}), ensure_ascii=False)))
         self.conn.commit()
         return cur.rowcount > 0
 

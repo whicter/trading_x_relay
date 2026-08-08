@@ -634,5 +634,64 @@ class StartupPathTest(unittest.TestCase):
             self.assertTrue(hasattr(x_relay, sym), f"{sym} 未定义")
 
 
+class TickerLevelBindingTest(unittest.TestCase):
+    """2026-08-08：点位必须绑定到标的，且个股点位不能被指数下限滤掉。
+
+    原 LEVEL_MIN=600 是给指数定的（SPY≈770），个股点位大量是两位数
+    （$arqq 19-20、$axti 89、$gdx 70）——全被丢弃，推送里只有原文没点位。
+    简报要求「看好的标的和点位都给出来」，扁平 levels 列表做不到：
+    「$aaoi 到 149，$axti 到 89」必须知道哪个数字属于谁。
+    下列全部是真实抓到的原文。"""
+
+    def test_two_tickers_two_levels_bound_separately(self):
+        c = classify_post(
+            "Both $aaoi and $axti have surged. $aaoi has reached 149 before "
+            "pulling back. $axti has reached 89.", assume_index=True)
+        self.assertEqual(c.ticker_levels.get("AAOI"), [149.0])
+        self.assertEqual(c.ticker_levels.get("AXTI"), [89.0])
+
+    def test_two_digit_stock_level_survives(self):
+        c = classify_post("For $arqq, I want to buy again at its pullback to 19-20.",
+                          assume_index=True)
+        self.assertEqual(c.ticker_levels.get("ARQQ"), [19.0, 20.0])
+
+    def test_commodity_etf_levels(self):
+        c = classify_post("I bought some when $gdx dipped below 70. "
+                          "$gdx 65-60 will be great buying opportunity.",
+                          assume_index=True)
+        # 顺序 = 文本出现顺序（70 在第一句，65-60 在第二句）。
+        # 保持出现顺序有意义：读的人能对上原文。
+        self.assertEqual(c.ticker_levels.get("GDX"), [70.0, 65.0, 60.0])
+
+    def test_wave_ordinals_are_not_levels(self):
+        """「wave-3」「5 waves」「第4浪」里的数字不是点位。
+
+        放宽到两位数后这类噪音会灌进来（实测 $spcx 那条抽出 3/7/23/8/1）。"""
+        c = classify_post("$abcd is in the wave-5 of C, forming 3 waves so far. "
+                          "Target 133.", assume_index=True)
+        self.assertEqual(c.ticker_levels.get("ABCD"), [133.0])
+
+    def test_date_slash_not_a_level(self):
+        c = classify_post("$xyz entered on 7/23 at the time of my post. Now 88.",
+                          assume_index=True)
+        self.assertNotIn(7.0, c.ticker_levels.get("XYZ", []))
+        self.assertNotIn(23.0, c.ticker_levels.get("XYZ", []))
+        self.assertIn(88.0, c.ticker_levels.get("XYZ", []))
+
+    def test_index_tickers_excluded_from_ticker_map(self):
+        """$SPX 走 levels，不进个股表——否则简报会把指数当个股列。"""
+        c = classify_post("$spx needs to break above 7750")
+        self.assertNotIn("SPX", c.ticker_levels)
+        self.assertIn(7750.0, c.levels)
+
+    def test_index_lower_bound_unchanged(self):
+        """指数侧下限仍是 600，行为不能被这次放宽改掉。
+
+        Mancini 的「a 400+ point vertical rally」里的 400 是点数不是点位。"""
+        c = classify_post("ES rallied 400+ points off the 7325 low")
+        self.assertNotIn(400.0, c.levels)
+        self.assertIn(7325.0, c.levels)
+
+
 if __name__ == "__main__":
     unittest.main()
