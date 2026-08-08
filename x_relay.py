@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from classifier import Classification, classify_post
+from classifier import PUSH_BLOCKED, Classification, classify_post
 from store import PostStore
 
 BASE = Path(__file__).resolve().parent
@@ -69,7 +69,10 @@ PER_ACCOUNT_DELAY = (4.0, 9.0)     # 账号间随机停顿
 PUSH_MAX_AGE_HOURS = 12            # 只推这么久以内发布的帖（防首轮回填刷屏）
 STRUCTURE_ALERT_COOLDOWN = 6 * 3600   # 页面结构失效告警冷却
 ALL_FAIL_ALERT_AFTER = 3           # 连续 N 轮全账号失败才告警（吸收网络抖动）
-PUSH_CLASSES = {"index_levels", "index_view"}
+# 2026-08-08：推送口径由白名单反转为黑名单，判据搬进 classifier.PUSH_BLOCKED
+# （用户决定：个股/商品/宏观/加密行情都要，只拦代币推广与杂谈）。
+# 此处不再维护类名清单，避免两处漂移——新增标签只需改 classifier。
+PUSH_RETRY_MAX = 5                 # 单条帖推送失败的最大重试轮数
 
 
 @dataclass
@@ -94,8 +97,10 @@ ACCOUNTS = [
     # → 大概率只出 index_view。留着是为了给 A.9「有图无数字」占比提供样本
     Account("willem82457275", "S&P500 指标图，点位多在图中"),
     # 实测：加密代币推广（Interlink/StarX/PACT），与指数无关。
-    # 不删——留作分类器的**负样本对照**：若它的帖子出现在推送里，说明分类器漏了
-    Account("time_and_trade", "实测为加密推广，预期全部被过滤"),
+    # 2026-08-08 剔除 @time_and_trade：14 条实抓里 12 条是代币项目推广
+    #（Interlink/StarX/Pact/Parallax——用户数里程碑、TGE、KYC、生态叙事），
+    # 与交易观点无关。分类器的 promo 规则能拦住，但让一个 86% 是广告的账号
+    # 留在名单里只会消耗每轮抓取预算并稀释信噪比。用户 2026-08-08 决定移除。
 ]
 
 
@@ -353,7 +358,7 @@ def format_push(post: dict, cls) -> str:
 
 
 def should_push(post: dict, cls, now_utc: datetime) -> bool:
-    if cls.label not in PUSH_CLASSES:
+    if not cls.is_pushable:
         return False
     if post.get("is_retweet"):
         return False
@@ -424,6 +429,11 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                                 post["post_id"],
                                 datetime.now(timezone.utc).isoformat())
                             result["pushed"] += 1
+                        else:
+                            # 失败不丢：计一次尝试，留给本轮末尾的重试队列。
+                            # 2026-08-08 前这里什么都不做，帖子已入库、
+                            # 下轮 insert_post 返回 False 就永久跳过了。
+                            store.bump_attempt(post["post_id"])
                 # 缺口判定（取代早先那个"整页全新"的粗略启发式）：只有当本轮
                 # 抓到的最旧一条 ≤ 上次的最新一条，两次窗口才算重叠、才**证明**
                 # 没漏。证明不了就记为 gap——未登录态因为翻不动页，几乎必然如此。
@@ -441,6 +451,31 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                 time.sleep(random.uniform(*PER_ACCOUNT_DELAY))
         finally:
             ctx.close()
+
+    # ── 重试队列：补发此前发送失败的帖 ─────────────────────────
+    # 放在抓取循环之后，避免与本轮新帖的推送挤在一起再次撞限流。
+    if not dry_run:
+        pending = store.pending_push(
+            sorted(PUSH_BLOCKED), PUSH_MAX_AGE_HOURS,
+            now_utc.isoformat(), PUSH_RETRY_MAX)
+        for pid, handle, pub, text, img, cls_label, lv in pending:
+            post = {"post_id": pid, "handle": handle, "published_at": pub,
+                    "text": text, "has_image": bool(img)}
+            cls = Classification(cls_label, json.loads(lv or "[]"), [])
+            if tg_send(format_push(post, cls)):
+                store.mark_pushed(pid, datetime.now(timezone.utc).isoformat())
+                result["pushed"] += 1
+                log(f"补发成功 @{handle} {pub[:16]}")
+            else:
+                store.bump_attempt(pid)
+            time.sleep(1.0)          # 限流是丢帖主因，补发放慢
+        # 重试用尽仍未送达 = 真的丢了，必须让人知道（原来是完全静默的）
+        gave_up = store.give_up_count(PUSH_RETRY_MAX)
+        if gave_up:
+            alert_once("giveup",
+                       f"⚠️ [X中继] {gave_up} 条帖重试 {PUSH_RETRY_MAX} 轮仍未推送成功，"
+                       f"已放弃。用 `--stats` 查看，或检查 TG 配置/限流。",
+                       STRUCTURE_ALERT_COOLDOWN)
 
     if result["structure_fail"] and not result["ok"]:
         alert_once("structure",
@@ -469,7 +504,7 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
 
 def run_loop(store: PostStore):
     log(f"进入轮询循环：每 {POLL_SECONDS}s ±{JITTER_SECONDS}s，"
-        f"{len(ACCOUNTS)} 个账号，推送类别 {sorted(PUSH_CLASSES)}")
+        f"{len(ACCOUNTS)} 个账号，拦截类别 {sorted(PUSH_BLOCKED)}（其余全推）")
     consecutive_all_fail = 0
     while True:
         try:
@@ -539,17 +574,20 @@ def push_latest(store: PostStore, per_account: int = 1, dry_run: bool = False,
     群里可能长时间是空的——老帖在 bootstrap 时全被标成"已见过"，新帖又还没发。
     那不是故障，但人看不到东西，也无从确认通道真的通。本命令用于
     「现在就让我看到各家最新在说什么」。
-    默认只推指数类；`include_filtered=True` 连个股/其他一起推（调试分类用）。"""
-    want = None if include_filtered else sorted(PUSH_CLASSES)
+    默认按 classifier.PUSH_BLOCKED 排除噪音类；`include_filtered=True` 连
+    promo/chatter 一起推（调试分类用）。"""
+    # 注意是 NOT IN（黑名单）。2026-08-08 从白名单反转时，若沿用原来的 IN，
+    # 语义会变成"只推被拦的那些"——正好反了。
+    blocked = None if include_filtered else sorted(PUSH_BLOCKED)
     n = 0
     for acct in ACCOUNTS:
         sql = ("SELECT post_id, handle, published_at, text, has_image, "
                "classification, levels FROM posts "
                "WHERE handle=? AND is_retweet=0 AND is_pinned=0 ")
         params = [acct.handle]
-        if want:
-            sql += "AND classification IN (%s) " % ",".join("?" * len(want))
-            params += want
+        if blocked:
+            sql += "AND (classification IS NULL OR classification NOT IN (%s)) " % ",".join("?" * len(blocked))
+            params += blocked
         sql += "ORDER BY published_at DESC LIMIT ?"
         params.append(per_account)
         for pid, handle, pub, text, img, cls_label, lv in store.conn.execute(sql, params):

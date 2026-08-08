@@ -24,7 +24,8 @@ CREATE TABLE IF NOT EXISTS posts (
     is_pinned    INTEGER NOT NULL DEFAULT 0,
     classification TEXT,
     levels       TEXT,               -- JSON array
-    pushed_at    TEXT                -- NULL = 未推送
+    pushed_at    TEXT,               -- NULL = 未推送
+    push_attempts INTEGER NOT NULL DEFAULT 0   -- 推送尝试次数（重试队列用）
 );
 CREATE TABLE IF NOT EXISTS fetch_log (
     ts      TEXT NOT NULL,
@@ -37,12 +38,23 @@ CREATE TABLE IF NOT EXISTS fetch_log (
 """
 
 
+def _iso_minus_hours(now_iso: str, hours: int) -> str:
+    from datetime import datetime, timedelta
+    dt = datetime.fromisoformat(now_iso.replace("Z", "+00:00"))
+    return (dt - timedelta(hours=hours)).isoformat().replace("+00:00", "Z")
+
+
 class PostStore:
     def __init__(self, path: Path):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(str(path))
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
+        # 老库迁移：push_attempts 是 2026-08-08 新增列
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(posts)")}
+        if "push_attempts" not in cols:
+            self.conn.execute(
+                "ALTER TABLE posts ADD COLUMN push_attempts INTEGER NOT NULL DEFAULT 0")
         self.conn.commit()
 
     def insert_post(self, post: dict) -> bool:
@@ -84,6 +96,43 @@ class PostStore:
             "AND published_at IS NOT NULL "
             "ORDER BY CAST(post_id AS INTEGER) DESC LIMIT 1", (handle,)).fetchone()
         return row[0] if row else None
+
+    def pending_push(self, blocked: list, max_age_hours: int,
+                     now_iso: str, retry_max: int) -> list:
+        """待重试推送的帖：入库了、该推、但至今 pushed_at 仍为 NULL。
+
+        **存在的理由（2026-08-08 事故）**：原流程是「先 insert_post 再 tg_send，
+        只有发送成功才 mark_pushed」。发送失败时帖子已经在库里，下一轮
+        insert_post 返回 False 直接 continue —— 那条帖**永久丢失，无重试、
+        无告警**。实测 Telegram 限流（单 chat 约 20 条/分钟）在 bootstrap
+        突发推送时吃掉了 2 条 index_levels。
+
+        与主仓库 alert_outbox 同一模式：先落库、只有 2xx 才标 delivered、
+        失败留在队列里重试。push_attempts 计数防止一条坏帖无限重试刷屏。
+        """
+        sql = ("SELECT post_id, handle, published_at, text, has_image, "
+               "classification, levels FROM posts "
+               "WHERE pushed_at IS NULL AND is_retweet=0 AND is_pinned=0 "
+               "AND published_at IS NOT NULL AND published_at > ? "
+               "AND push_attempts < ? ")
+        params = [_iso_minus_hours(now_iso, max_age_hours), retry_max]
+        if blocked:
+            sql += "AND (classification IS NULL OR classification NOT IN (%s)) " % ",".join("?" * len(blocked))
+            params += blocked
+        sql += "ORDER BY published_at"
+        return self.conn.execute(sql, params).fetchall()
+
+    def bump_attempt(self, post_id: str):
+        self.conn.execute(
+            "UPDATE posts SET push_attempts = push_attempts + 1 WHERE post_id=?",
+            (post_id,))
+        self.conn.commit()
+
+    def give_up_count(self, retry_max: int) -> int:
+        """已放弃重试的条数——非零说明有帖子真的没送出去，必须让人知道。"""
+        return self.conn.execute(
+            "SELECT COUNT(*) FROM posts WHERE pushed_at IS NULL "
+            "AND push_attempts >= ?", (retry_max,)).fetchone()[0]
 
     def mark_pushed(self, post_id: str, ts: str):
         self.conn.execute("UPDATE posts SET pushed_at=? WHERE post_id=? AND pushed_at IS NULL",

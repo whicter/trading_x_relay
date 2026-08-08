@@ -212,12 +212,26 @@ class PushGatingTest(unittest.TestCase):
         d.update(kw)
         return d
 
-    def test_push_index_not_stock(self):
+    def test_push_all_trading_content_block_only_noise(self):
+        """2026-08-08 口径反转：原断言是「个股不推」，那正是被改掉的行为。
+
+        用户决定：个股/商品/宏观/加密行情全要，只拦代币推广与杂谈。
+        本测试因此从「白名单」改为守住「黑名单」——推的判据是
+        classification 不在 PUSH_BLOCKED 里，不是 is_index。"""
         now = datetime.now(timezone.utc)
-        idx = classify_post("ES 6900 key")
-        stock = classify_post("$MRNA to 160")
-        self.assertTrue(x_relay.should_push(self._post(), idx, now))
-        self.assertFalse(x_relay.should_push(self._post(), stock, now))
+        for text, should in [
+            ("ES 6900 key", True),                                    # 指数
+            ("$MRNA to 160", True),                                   # 个股（原来被拦）
+            ("gold and silver miners look strong here", True),        # 商品
+            ("BTC broke support, next target 88,000", True),          # 加密行情
+            ("Fed likely cuts rates, tariffs still the wildcard", True),  # 宏观
+            ("StarX ($STRX): KYC open, TGE in Q4", False),            # 代币推广
+            ("— J.K. Rowling", False),                                # 鸡汤
+        ]:
+            cls = classify_post(text)
+            self.assertEqual(
+                x_relay.should_push(self._post(), cls, now), should,
+                f"{text!r} → {cls.label}，期望 push={should}")
 
     def test_no_push_retweet(self):
         now = datetime.now(timezone.utc)
@@ -461,6 +475,163 @@ class NeverTradesTest(unittest.TestCase):
             elif isinstance(node, ast.Attribute):
                 hits += node.attr in self.FORBIDDEN_NAMES
         self.assertGreaterEqual(hits, 2)
+
+
+# ══════════════════════════════════════════════════════════════
+# 2026-08-08 口径反转：白名单 index_* → 黑名单（只拦与交易无关的）
+# 用户决定：个股/商品/宏观/加密行情都要推。
+# 下列用例全部来自**真实抓取的帖子**，不是构造的。
+# ══════════════════════════════════════════════════════════════
+class BlacklistPushPolicyTest(unittest.TestCase):
+    def test_commodity_is_pushed(self):
+        """Dayu 08-07 真帖。旧口径判 stock 被丢弃——正是用户认为他准的那类。"""
+        c = classify_post("Among all the asset classes, I think gold, silver, "
+                          "and miners are the most appealing investment asset now. "
+                          "I bought some when $gdx dipped below 70.",
+                          assume_index=True)
+        self.assertEqual(c.label, "commodity")
+        self.assertTrue(c.is_pushable)
+
+    def test_stock_levels_are_pushed(self):
+        """Dayu 08-08 真帖：$arqq 回调 19-20 是可打分的点位。"""
+        c = classify_post("quantum stocks ($qtum, $ionq, $rgti, $qbts, $arqq) "
+                          "popped up recently. For $arqq, I want to buy again "
+                          "at its pullback to 19-20.", assume_index=True)
+        self.assertEqual(c.label, "stock")
+        self.assertTrue(c.is_pushable)
+
+    def test_macro_is_pushed(self):
+        c = classify_post("Fed likely cuts rates next meeting, tariffs still "
+                          "the wildcard for risk assets")
+        self.assertEqual(c.label, "macro")
+        self.assertTrue(c.is_pushable)
+
+    def test_crypto_market_view_is_pushed(self):
+        """用户 2026-08-08 明确要 BTC。"""
+        c = classify_post("BTC broke down below its support, next target 88,000")
+        self.assertEqual(c.label, "crypto")
+        self.assertTrue(c.is_pushable)
+
+    def test_crypto_product_announcement_is_blocked(self):
+        """真帖：提到 BTC/ETH 但那是产品公告不是行情观点。
+
+        没有 TGE/KYC 这类硬词，仅靠 _PROMO 拦不住——2026-08-08 真实回放
+        发现它会被判成 crypto 推出去。"""
+        c = classify_post("From BTC to Tron, and everything between. Pact now "
+                          "runs native swaps across BTC, ETH, BNB, LTC.")
+        self.assertEqual(c.label, "promo")
+        self.assertFalse(c.is_pushable)
+
+    def test_token_promo_with_cashtag_is_blocked(self):
+        """带 $TICKER 也不能当 stock 推——拦截必须先于标的判定。"""
+        c = classify_post("StarX Network ($STRX) is progressing. KYC is open, "
+                          "preparing TGE in Q4 2026.")
+        self.assertEqual(c.label, "promo")
+        self.assertFalse(c.is_pushable)
+
+    def test_disclaimer_is_blocked(self):
+        c = classify_post("这个账户是我自己对着镜子自己说，不作为任何投资建议。盈亏自负，概不负责。")
+        self.assertFalse(c.is_pushable)
+
+    def test_quote_is_blocked(self):
+        c = classify_post("“It's impossible to live without failing at something.”\n\n— J.K. Rowling")
+        self.assertFalse(c.is_pushable)
+
+    def test_assume_index_view_without_ticker_or_number(self):
+        """novicetrader888 真帖：无标的、无数字，但是明确持仓观点。
+
+        旧口径掉进 other 被拦。assume_index 账号本就被确认专发指数评论。"""
+        c = classify_post("多头不用太紧张，似乎上面还有油水虽然不多。"
+                          "但连续短时间超买也有个喘气的机会不是？继续持多设好止损",
+                          assume_index=True)
+        self.assertEqual(c.label, "index_view")
+        self.assertTrue(c.is_pushable)
+
+    def test_plain_account_chatter_not_promoted(self):
+        """非 assume_index 账号不享受上面那条路径，否则任何闲聊都会被推。"""
+        c = classify_post("going long on life today, no stops")
+        self.assertFalse(c.is_pushable)
+
+    def test_disclaimer_with_ticker_is_still_a_view(self):
+        """「$spx 见顶，盈亏自负」是观点不是免责声明——拦截不得误杀。"""
+        c = classify_post("$spx 见顶了，我开始做空。盈亏自负。")
+        self.assertTrue(c.is_pushable)
+
+
+class PushRetryTest(unittest.TestCase):
+    """2026-08-08 事故：发送失败 = 永久丢失，无重试无告警。"""
+
+    def setUp(self):
+        import tempfile
+        self.dir = tempfile.mkdtemp()
+        self.store = PostStore(Path(self.dir) / "t.sqlite3")
+
+    def _post(self, pid, pub, cls="index_levels"):
+        return {"post_id": pid, "handle": "h", "author": "h",
+                "published_at": pub, "fetched_at": pub, "text": "SPX 7700",
+                "classification": cls, "levels": [7700.0]}
+
+    def test_failed_push_stays_in_queue(self):
+        now = "2026-08-08T12:00:00+00:00"
+        self.store.insert_post(self._post("1", "2026-08-08T11:00:00Z"))
+        pending = self.store.pending_push(["promo", "chatter", "other"], 12, now, 5)
+        self.assertEqual(len(pending), 1, "未推送的帖必须留在重试队列里")
+
+    def test_pushed_post_leaves_queue(self):
+        now = "2026-08-08T12:00:00+00:00"
+        self.store.insert_post(self._post("1", "2026-08-08T11:00:00Z"))
+        self.store.mark_pushed("1", now)
+        self.assertEqual(
+            len(self.store.pending_push(["other"], 12, now, 5)), 0)
+
+    def test_retry_gives_up_after_max(self):
+        now = "2026-08-08T12:00:00+00:00"
+        self.store.insert_post(self._post("1", "2026-08-08T11:00:00Z"))
+        for _ in range(5):
+            self.store.bump_attempt("1")
+        self.assertEqual(len(self.store.pending_push(["other"], 12, now, 5)), 0,
+                         "超过重试上限应退出队列")
+        self.assertEqual(self.store.give_up_count(5), 1,
+                         "放弃的条数必须可见——原来是完全静默的")
+
+    def test_blocked_class_never_queued(self):
+        now = "2026-08-08T12:00:00+00:00"
+        self.store.insert_post(self._post("1", "2026-08-08T11:00:00Z", cls="promo"))
+        self.assertEqual(len(self.store.pending_push(["promo"], 12, now, 5)), 0)
+
+    def test_old_post_not_queued(self):
+        """12h 时效门对重试同样生效，避免补发几天前的旧帖刷屏。"""
+        now = "2026-08-08T12:00:00+00:00"
+        self.store.insert_post(self._post("1", "2026-08-05T11:00:00Z"))
+        self.assertEqual(len(self.store.pending_push(["other"], 12, now, 5)), 0)
+
+
+class AccountListTest(unittest.TestCase):
+    def test_time_and_trade_removed(self):
+        """14 条实抓里 12 条是代币推广，2026-08-08 用户决定移除。"""
+        import x_relay
+        self.assertNotIn("time_and_trade",
+                         {a.handle for a in x_relay.ACCOUNTS})
+
+
+class StartupPathTest(unittest.TestCase):
+    """2026-08-08：口径反转时漏改 run_loop 的启动日志，进程起不来。
+
+    单测全在纯函数上，没有一条覆盖 run_loop 的启动路径——重启后才炸。
+    这条用 import 期的符号检查兜住同类遗漏（不需要真跑循环）。"""
+
+    def test_no_stale_push_classes_symbol(self):
+        import ast
+        src = (Path(__file__).resolve().parent.parent / "x_relay.py").read_text(encoding="utf-8")
+        names = {n.id for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Name)}
+        self.assertNotIn("PUSH_CLASSES", names,
+                         "白名单常量已废弃，残留引用会让进程启动即崩")
+
+    def test_module_level_names_all_resolvable(self):
+        """所有模块级引用的自定义常量都必须真的存在。"""
+        import x_relay
+        for sym in ("PUSH_BLOCKED", "PUSH_RETRY_MAX", "PUSH_MAX_AGE_HOURS", "ACCOUNTS"):
+            self.assertTrue(hasattr(x_relay, sym), f"{sym} 未定义")
 
 
 if __name__ == "__main__":
