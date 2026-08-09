@@ -468,7 +468,9 @@ def should_push(post: dict, cls, now_utc: datetime) -> bool:
 
 
 # ── 主流程 ──────────────────────────────────────────────────
-def run_once(store: PostStore, dry_run: bool = False) -> dict:
+def run_once(store: PostStore, dry_run: bool = False,
+             write_hb: bool = True) -> dict:
+    """跑一轮抓取。`write_hb=False` 用于人工一次性诊断（见 main 的 --once）。"""
     from playwright.sync_api import sync_playwright
 
     now_utc = datetime.now(timezone.utc)
@@ -588,12 +590,21 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                    f"{', '.join(result['gap'])}\n"
                    "要么发帖量暴增，要么登录态掉了导致翻页失效。",
                    6 * 3600)
-    write_heartbeat(
-        ok=bool(result["ok"]),
-        detail={"accounts_ok": result["ok"], "accounts_fail": result["fail"],
-                "structure_fail": result["structure_fail"],
-                "gap": result["gap"], "logged_in": result["logged_in"],
-                "new_posts": result["new"], "pushed": result["pushed"]})
+    # 心跳的语义是"**守护进程**还活着并在循环"，一次性诊断跑不算。写了会骗人：
+    # watchdog 对"pm2 online 但进程卡死"的唯一探测手段就是心跳新鲜度
+    # （health_watchdog.py::bot_health_failure「心跳过期 → 进程卡死/停更」）。
+    # 而卡死时人做的第一件事，正是按告警提示跑 `--once --dry-run`——那一下就把
+    # 心跳刷新了，卡死信号被抹掉，watchdog 转头就安静，人还以为"跑一下就好了"。
+    # 2026-08-09 实测：pm2 stop 之后跑一次 --once，心跳文件立刻变成
+    # connected=true 的新鲜记录。（进程 stopped 这一种仍能被 watchdog 的
+    # pm2 status 独立抓到，被这个副作用掩盖的是"online 但卡死"那一种。）
+    if write_hb:
+        write_heartbeat(
+            ok=bool(result["ok"]),
+            detail={"accounts_ok": result["ok"], "accounts_fail": result["fail"],
+                    "structure_fail": result["structure_fail"],
+                    "gap": result["gap"], "logged_in": result["logged_in"],
+                    "new_posts": result["new"], "pushed": result["pushed"]})
     return result
 
 
@@ -753,7 +764,8 @@ def main() -> int:
         elif args.stats:
             print_stats(store)
         elif args.once:
-            r = run_once(store, dry_run=args.dry_run)
+            # write_hb=False：一次性诊断绝不冒充守护进程的心跳，见 run_once 末尾。
+            r = run_once(store, dry_run=args.dry_run, write_hb=False)
             log(f"完成：ok={r['ok']} fail={r['fail']} "
                 f"结构失效={r['structure_fail']} 新帖 {r['new']} 推送 {r['pushed']}")
             return 0 if r["ok"] else 2

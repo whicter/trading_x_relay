@@ -828,5 +828,47 @@ class StructureAlertTest(unittest.TestCase):
                          "结构失效告警需要跨轮去抖，必须留在 run_loop")
 
 
+class DiagnosticSideEffectTest(unittest.TestCase):
+    """人工一次性诊断不得改动生产监控状态。
+
+    2026-08-09 实测：`pm2 stop x-levels-relay` 之后跑一次 `--once`，主仓库的
+    data/runtime/heartbeat/x-levels-relay.json 立刻变成 connected=true 的新鲜
+    记录——进程明明停着。watchdog 对"pm2 online 但进程卡死"的唯一探测手段就是
+    心跳新鲜度（health_watchdog.py::bot_health_failure），而卡死时人做的第一件
+    事，正是按告警文案提示跑 `--once --dry-run`：一跑就把卡死信号抹掉。"""
+
+    @staticmethod
+    def _fn(name):
+        src = (Path(__file__).resolve().parent.parent
+               / "x_relay.py").read_text(encoding="utf-8")
+        return next(n for n in ast.walk(ast.parse(src))
+                    if isinstance(n, ast.FunctionDef) and n.name == name)
+
+    @staticmethod
+    def _run_once_calls(fn):
+        return [c for c in ast.walk(fn) if isinstance(c, ast.Call)
+                and getattr(c.func, "id", None) == "run_once"]
+
+    def test_once_disables_heartbeat(self):
+        calls = self._run_once_calls(self._fn("main"))
+        self.assertEqual(len(calls), 1, "main() 里应只有 --once 那一处 run_once")
+        kw = {k.arg: k.value for k in calls[0].keywords}
+        self.assertIn("write_hb", kw, "--once 必须显式关掉心跳写入")
+        self.assertIs(kw["write_hb"].value, False)
+
+    def test_loop_keeps_heartbeat(self):
+        """守护进程路径必须照常写心跳，否则 watchdog 反过来彻底瞎了。"""
+        for call in self._run_once_calls(self._fn("run_loop")):
+            for k in call.keywords:
+                self.assertNotEqual(
+                    (k.arg, getattr(k.value, "value", None)), ("write_hb", False),
+                    "run_loop 关掉心跳 = watchdog 再也发现不了这个进程卡死")
+
+    def test_default_is_to_write(self):
+        import inspect
+        p = inspect.signature(x_relay.run_once).parameters["write_hb"]
+        self.assertIs(p.default, True, "默认必须写——只有诊断路径才显式关")
+
+
 if __name__ == "__main__":
     unittest.main()

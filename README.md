@@ -79,8 +79,39 @@ venv/bin/python3.11 x_relay.py --once --dry-run # 抓一轮只打印（验证用
 venv/bin/python3.11 x_relay.py --once           # 抓一轮并推送
 venv/bin/python3.11 x_relay.py --loop           # 常驻轮询（15min ± 2min）
 venv/bin/python3.11 x_relay.py --stats          # 台账分布（含「有图无数字」占比）
-venv/bin/python3.11 -m unittest discover -s tests   # 单测（38 例）
+venv/bin/python3.11 -m unittest discover -s tests   # 单测
 ```
+
+### 常驻进程跑着的时候能不能跑 `--once`？
+
+**能，不用先 `pm2 stop`。** 结构失效告警的文案就是让人跑 `--once --dry-run`
+去诊断的——故障时人最需要它，而那恰恰是常驻进程还在跑的时候，所以这条
+必须成立。2026-08-09 实测确认过两件事：
+
+**① Chromium profile 不冲突。** `run_once` 和 `do_login` 都用同一个
+`runtime/x_profile` 开 `launch_persistent_context`，直觉上会撞 Chromium 的
+单例锁。实测不会：Playwright 的 Chromium **不创建 `SingletonLock`**，两个
+上下文同时开在这个目录上都正常工作（无竞争基线 32s，故意占住锁的对照 39s，
+均 4/4 账号成功、退出码 0）。而且锁本来也只在每轮那几十秒里才可能被持有——
+`launch_persistent_context` 在 `run_once` 内部开、结束即 `ctx.close()`，
+900 秒周期里占空比约 4%，两轮之间连浏览器进程都没有。
+
+理论上两个 Chromium 共用一个 profile 仍不是好习惯（单例锁存在就是为了防这个），
+但这里的爆炸半径是零：该 profile **只存 guest cookie、无任何凭据**，
+中继本来就跑在未登录态（心跳里 `logged_in: false`），坏了删掉重建即可。
+
+**② 但 `--once` 绝不能写心跳**（已修）。诊断跑一次会把主仓库的
+`data/runtime/heartbeat/x-levels-relay.json` 刷成新鲜的 `connected=true`——
+而 watchdog 对「pm2 显示 online、进程其实卡死」的唯一探测手段就是心跳新鲜度
+（`health_watchdog.py::bot_health_failure`）。于是：进程卡死 → 心跳变旧 →
+watchdog 正要告警 → 人按提示跑一次诊断 → 心跳被刷新 → 告警消失 → 人以为
+「跑一下就好了」，卡死的进程继续没人管。现在 `--once` 传 `write_hb=False`，
+只有 `--loop` 写心跳；心跳的语义是「**守护进程**还活着并在循环」，
+一次性诊断不算。三条测试锁住这个约束（含反向的：`run_loop` 不许关心跳）。
+
+> 注意 `--once`（不带 `--dry-run`）会**真的推送**并导出简报文件；
+> `--dry-run` 则绝不写 posts 表——它若把帖子标成"已见过"，真正的循环之后
+> 就再也不会推它们（2026-08-07 实测被一次 dry-run 吃掉过 10 条新帖）。
 
 ## 部署
 
@@ -94,8 +125,12 @@ pm2 save
 ```
 
 主仓库 CLAUDE.md「规则 2」同样适用：部署后须在
-`quantrift_index_future/health_watchdog.py::BOTS` 登记（心跳文件
-`runtime/heartbeat.json`，绝对路径），否则进程挂掉无人知道。
+`quantrift_index_future/health_watchdog.py::BOTS` 登记，否则进程挂掉无人知道。
+
+心跳写的是**主仓库**的 `data/runtime/heartbeat/x-levels-relay.json`
+（纯 JSON 约定，双方不互相 import；路径可用 `QR_HEARTBEAT_DIR` 覆盖）。
+本仓库的 `runtime/heartbeat.json` 是 2026-08-06 改走主仓库目录之前的遗留文件，
+**早已不再更新，排查时别拿它当依据**。
 
 ## 2026-08-08：推送口径反转 + 修静默丢失
 
