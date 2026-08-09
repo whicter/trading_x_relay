@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import sys
 import tempfile
 import unittest
@@ -691,6 +692,140 @@ class TickerLevelBindingTest(unittest.TestCase):
         c = classify_post("ES rallied 400+ points off the 7325 low")
         self.assertNotIn(400.0, c.levels)
         self.assertIn(7325.0, c.levels)
+
+
+class _Stop(BaseException):
+    """跳出 run_loop 的哨兵。
+
+    必须继承 BaseException：run_loop 里 `except Exception` 会把普通异常当成
+    "本轮失败、下轮重试"吞掉，用 Exception 就停不下来。"""
+
+
+class _FakeTime:
+    """只替换 x_relay 模块里的 time 引用，不动全局 time 模块。"""
+
+    def __init__(self):
+        self.slept = []
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+
+    def time(self):
+        return 1_800_000_000.0
+
+
+class StructureAlertTest(unittest.TestCase):
+    """2026-08-09 误报：单轮抖动报「抓取停摆」，自愈后无恢复通知。
+
+    StructureError 是 25 秒选择器超时抛的——"X 改版了"和"这次页面加载慢"
+    产生完全相同的信号，单轮区分不了。当天 10:15 那轮 4 个账号整齐地每
+    31 秒失败一个，10:32 全部恢复，此后 12 小时正常；但告警一直挂在手机上，
+    因为压根没有恢复通知。两个缺陷各自都能单独造成误导，分开测。"""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.sent = []
+        self.send_ok = True
+        self._saved = {k: getattr(x_relay, k) for k in
+                       ("ALERT_STATE", "tg_send", "run_once", "write_heartbeat",
+                        "time", "JITTER_SECONDS", "log")}
+        x_relay.ALERT_STATE = Path(self.dir) / "alert_state.json"
+        x_relay.tg_send = self._tg_send
+        x_relay.write_heartbeat = lambda **kw: None
+        x_relay.log = lambda *a, **k: None
+        x_relay.time = _FakeTime()
+        x_relay.JITTER_SECONDS = 0
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(x_relay, k, v)
+
+    def _tg_send(self, text):
+        if self.send_ok:
+            self.sent.append(text)
+        return self.send_ok
+
+    @staticmethod
+    def _ok(n=4):
+        return {"ok": [f"a{i}" for i in range(n)], "fail": [],
+                "structure_fail": [], "gap": [], "new": 0, "pushed": 0}
+
+    @staticmethod
+    def _struct():
+        return {"ok": [], "fail": [], "structure_fail": ["a0", "a1"],
+                "gap": [], "new": 0, "pushed": 0}
+
+    def _drive(self, rounds):
+        """用真正的 run_loop 跑给定轮次——测循环本身，不是它的复制品。"""
+        seq = list(rounds)
+
+        def fake_run_once(store, dry_run=False):
+            if not seq:
+                raise _Stop()
+            return seq.pop(0)
+
+        x_relay.run_once = fake_run_once
+        try:
+            x_relay.run_loop(None)
+        except _Stop:
+            pass
+
+    def _alerts(self):
+        return [m for m in self.sent if "抓取停摆" in m]
+
+    def _recoveries(self):
+        return [m for m in self.sent if "抓取已恢复" in m]
+
+    def test_single_round_does_not_alert(self):
+        """就是 08-09 那次误报的直接回归：一轮全灭 + 下轮恢复 = 不该告警。"""
+        self._drive([self._struct(), self._ok()])
+        self.assertEqual(self._alerts(), [], "单轮抖动不能报「抓取停摆」")
+        self.assertEqual(self._recoveries(), [], "没告警过就不该发恢复通知")
+
+    def test_two_consecutive_rounds_alert(self):
+        self._drive([self._struct(), self._struct()])
+        self.assertEqual(len(self._alerts()), 1, "连续两轮全灭必须告警一次")
+        self.assertIn("30 分钟", self._alerts()[0], "告警要说明已持续多久")
+
+    def test_recovery_notifies_once_and_clears_state(self):
+        self._drive([self._struct(), self._struct(), self._ok(), self._ok()])
+        self.assertEqual(len(self._alerts()), 1)
+        self.assertEqual(len(self._recoveries()), 1, "恢复只通知一次，不能每轮刷")
+        state = json.loads(x_relay.ALERT_STATE.read_text())
+        self.assertNotIn("structure", state,
+                         "恢复后必须清状态，否则下次真故障被 6h 冷却压掉")
+
+    def test_partial_success_is_healthy(self):
+        """个别账号失败但有账号抓到 = 抓取通路是好的，不是停摆。"""
+        partial = {"ok": ["a0"], "fail": [], "structure_fail": ["a1"],
+                   "gap": [], "new": 0, "pushed": 0}
+        self._drive([partial, partial, partial])
+        self.assertEqual(self._alerts(), [])
+
+    def test_failed_send_keeps_alert_state(self):
+        """恢复通知发不出去时不能清状态——否则这条事实被静默丢掉。"""
+        x_relay.ALERT_STATE.write_text(json.dumps({"structure": 1.0}))
+        self.send_ok = False
+        self.assertFalse(x_relay.resolve_alert("structure", "✅ 恢复"))
+        self.assertIn("structure", json.loads(x_relay.ALERT_STATE.read_text()))
+
+    def test_resolve_is_noop_when_never_alerted(self):
+        x_relay.ALERT_STATE.write_text(json.dumps({}))
+        self.assertFalse(x_relay.resolve_alert("structure", "✅ 恢复"))
+        self.assertEqual(self.sent, [])
+
+    def test_once_path_does_not_alert(self):
+        """`--once --dry-run` 正是告警文案让人跑的诊断命令，它自己不能再报警。"""
+        src = (Path(__file__).resolve().parent.parent
+               / "x_relay.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "run_once")
+        keys = [c.args[0].value for c in ast.walk(fn)
+                if isinstance(c, ast.Call)
+                and getattr(c.func, "id", None) == "alert_once"
+                and c.args and isinstance(c.args[0], ast.Constant)]
+        self.assertNotIn("structure", keys,
+                         "结构失效告警需要跨轮去抖，必须留在 run_loop")
 
 
 if __name__ == "__main__":

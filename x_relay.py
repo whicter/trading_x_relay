@@ -69,6 +69,13 @@ PER_ACCOUNT_DELAY = (4.0, 9.0)     # 账号间随机停顿
 PUSH_MAX_AGE_HOURS = 12            # 只推这么久以内发布的帖（防首轮回填刷屏）
 STRUCTURE_ALERT_COOLDOWN = 6 * 3600   # 页面结构失效告警冷却
 ALL_FAIL_ALERT_AFTER = 3           # 连续 N 轮全账号失败才告警（吸收网络抖动）
+# 结构失效同样要去抖。StructureError 是 25 秒选择器超时抛的，"X 改版了"和
+# "这一次页面加载慢/被临时限流"产生**完全相同**的信号，单轮判不出区别。
+# 2026-08-09 实测：10:15 那一轮 4 个账号整齐地每 31 秒失败一个（25s 超时 +
+# 翻页开销），下一轮全部恢复，此后 12 小时正常——却报了"抓取停摆"。
+# 真改版会持续数小时，多等一轮（约 15 分钟）零成本；单轮误报的代价是
+# 人对告警脱敏。取 2 而非 all_fail 的 3，因为结构失效是更具体的信号。
+STRUCTURE_ALERT_AFTER = 2
 # 2026-08-08：推送口径由白名单反转为黑名单，判据搬进 classifier.PUSH_BLOCKED
 # （用户决定：个股/商品/宏观/加密行情都要，只拦代币推广与杂谈）。
 # 此处不再维护类名清单，避免两处漂移——新增标签只需改 classifier。
@@ -134,20 +141,45 @@ def tg_send(text: str) -> bool:
         return False
 
 
-def alert_once(key: str, text: str, cooldown: int):
-    """带冷却的告警（登录失效这类持续状态，不刷屏但也不静默）。"""
-    state = {}
+def _load_alert_state() -> dict:
     if ALERT_STATE.exists():
         try:
-            state = json.loads(ALERT_STATE.read_text())
+            return json.loads(ALERT_STATE.read_text())
         except Exception:                                     # noqa: BLE001
-            state = {}
+            pass
+    return {}
+
+
+def alert_once(key: str, text: str, cooldown: int):
+    """带冷却的告警（登录失效这类持续状态，不刷屏但也不静默）。"""
+    state = _load_alert_state()
     now = time.time()
     if now - state.get(key, 0) < cooldown:
         return
     if tg_send(text):
         state[key] = now
         ALERT_STATE.write_text(json.dumps(state))
+
+
+def resolve_alert(key: str, text: str) -> bool:
+    """故障解除：只有此前真发出过 `key` 这条告警时，才通知一次并清掉状态。
+
+    没告警过就静默返回，否则每一轮正常抓取都会刷一条"已恢复"。发送失败
+    **不清状态**，下一轮再试——与 alert_once 同口径：宁可迟到，不可把
+    "已恢复"这条事实静默丢掉。
+
+    2026-08-09 之前根本没有恢复通知：当天 10:15 一次单轮抖动报了"抓取停摆"，
+    10:32 就自愈了，但那条告警在手机上一直挂着，人看到的始终是"还停着"——
+    实际此后 12 小时全部正常。**故障告警必须成对**，只报不销等于长期误导。
+    """
+    state = _load_alert_state()
+    if key not in state:
+        return False
+    if not tg_send(text):
+        return False
+    state.pop(key, None)
+    ALERT_STATE.write_text(json.dumps(state))
+    return True
 
 
 EXPORT_PATH = Path.home() / "Documents/quantrift_index_future/data/runtime/x_levels_export.json"
@@ -542,12 +574,10 @@ def run_once(store: PostStore, dry_run: bool = False) -> dict:
                        f"已放弃。用 `--stats` 查看，或检查 TG 配置/限流。",
                        STRUCTURE_ALERT_COOLDOWN)
 
-    if result["structure_fail"] and not result["ok"]:
-        alert_once("structure",
-                   "⚠️ [X中继] 所有账号都拿不到帖子，抓取停摆。\n"
-                   "多半是 X 改版、被反爬拦截，或登录态失效，需人工看 "
-                   "`x_relay.py --once --dry-run` 的输出。",
-                   STRUCTURE_ALERT_COOLDOWN)
+    # 「所有账号都拿不到帖子」的告警**不在这里发**：单轮判不出"改版"还是
+    # "这次慢了"，去抖需要跨轮状态，因此归 run_loop 管（见 STRUCTURE_ALERT_AFTER）。
+    # 这也顺带修掉：`--once --dry-run` 本是告警文案让人跑的诊断命令，以前它自己
+    # 会再发一条"抓取停摆"。一次性诊断的结论走退出码 2 和日志，不该进 Telegram。
     # 未登录态每轮固定约 5 条、翻不动页，几乎每轮都证明不了无遗漏——那种情况
     # 每轮告警等于噪音，只在**登录态下**仍证明不了时才报（那才是真异常：
     # 要么帖子多到翻 25 屏还没接上，要么登录态掉了）。
@@ -571,12 +601,24 @@ def run_loop(store: PostStore):
     log(f"进入轮询循环：每 {POLL_SECONDS}s ±{JITTER_SECONDS}s，"
         f"{len(ACCOUNTS)} 个账号，拦截类别 {sorted(PUSH_BLOCKED)}（其余全推）")
     consecutive_all_fail = 0
+    consecutive_structure = 0
     while True:
         try:
             r = run_once(store)
             if r["structure_fail"] and not r["ok"]:
-                consecutive_all_fail = 0                      # 已单独告警
+                consecutive_structure += 1
+                consecutive_all_fail = 0                      # 归 structure 路径管
+                if consecutive_structure >= STRUCTURE_ALERT_AFTER:
+                    mins = consecutive_structure * POLL_SECONDS // 60
+                    alert_once(
+                        "structure",
+                        f"⚠️ [X中继] 连续 {consecutive_structure} 轮（约 {mins} 分钟）"
+                        "所有账号都拿不到帖子，抓取停摆。\n"
+                        "多半是 X 改版、被反爬拦截，或登录态失效，需人工看 "
+                        "`x_relay.py --once --dry-run` 的输出。",
+                        STRUCTURE_ALERT_COOLDOWN)
             elif not r["ok"]:
+                consecutive_structure = 0
                 consecutive_all_fail += 1
                 if consecutive_all_fail == ALL_FAIL_ALERT_AFTER:
                     alert_once("all_fail",
@@ -584,7 +626,12 @@ def run_loop(store: PostStore):
                                "（非登录墙），可能是选择器失效或网络问题，需人工看日志",
                                3600)
             else:
+                # 有账号抓到了 = 抓取通路是好的，哪怕个别账号仍失败。
+                consecutive_structure = 0
                 consecutive_all_fail = 0
+                resolve_alert(
+                    "structure",
+                    f"✅ [X中继] 抓取已恢复：本轮 {len(r['ok'])} 个账号正常拿到帖子。")
         except Exception as e:                                # noqa: BLE001
             log(f"轮询异常（下一轮重试）: {e}")
             write_heartbeat(ok=False, detail={"error": str(e)[:300]})
