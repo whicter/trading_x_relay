@@ -614,6 +614,62 @@ class AccountListTest(unittest.TestCase):
         self.assertNotIn("time_and_trade",
                          {a.handle for a in x_relay.ACCOUNTS})
 
+    def test_2026_08_11_additions_present(self):
+        import x_relay
+        handles = {a.handle for a in x_relay.ACCOUNTS}
+        for h in ("gexedgeio", "alphaticaio", "zerohedge", "mentoviax"):
+            self.assertIn(h, handles)
+
+    def test_zerohedge_never_assumes_index(self):
+        """实测：zerohedge 的 "subprime (FICO <660)" 在 assume_index 下会被
+        当成指数点位 660 而误判 index_levels。宏观新闻流里这种裸数字极多，
+        标了这个开关等于给假点位开闸。"""
+        import x_relay
+        zh = next(a for a in x_relay.ACCOUNTS if a.handle == "zerohedge")
+        self.assertFalse(zh.assume_index)
+        c = classify_post(
+            "Record jump in subprime (FICO &lt;660) auto loan originations",
+            assume_index=zh.assume_index)
+        self.assertNotIn(660.0, c.levels)
+
+    def test_stock_accounts_do_not_assume_index(self):
+        """个股账号标 assume_index 会让个股点位按指数口径处理（600 下限）。"""
+        import x_relay
+        for h in ("mentoviax", "gexedgeio", "alphaticaio"):
+            a = next(x for x in x_relay.ACCOUNTS if x.handle == h)
+            self.assertFalse(a.assume_index, f"{h} 不该标 assume_index")
+
+
+class GapAlertGateTest(unittest.TestCase):
+    """漏帖告警不得再被 `logged_in` 掐死（2026-08-11）。
+
+    本服务走免登录路线，`logged_in`（mode == "testid"）恒为 False，所以原来
+    `if result["gap"] and result["logged_in"]` 让这条告警从上线起一次都不可能
+    触发。而完整性证明在免登录下**确实有效**：1682 次抓取全部证明无遗漏。
+    加入 @zerohedge（约 6 分钟一帖、可见窗口约 36 分钟）后，撑爆窗口成为
+    现实风险，漏帖必须报出来而不是静默。"""
+
+    def test_gap_alert_not_gated_on_logged_in(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "x_relay.py").read_text(encoding="utf-8")
+        fn = next(n for n in ast.walk(ast.parse(src))
+                  if isinstance(n, ast.FunctionDef) and n.name == "run_once")
+        gated = []
+        for node in ast.walk(fn):
+            if not isinstance(node, ast.If):
+                continue
+            calls_alert = any(
+                isinstance(c, ast.Call) and getattr(c.func, "id", None) == "alert_once"
+                for c in ast.walk(node))
+            if not calls_alert:
+                continue
+            names = {n.value for n in ast.walk(node.test)
+                     if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+            if "logged_in" in names:
+                gated.append(ast.dump(node.test))
+        self.assertEqual(gated, [],
+                         "告警条件里出现 logged_in —— 免登录下恒为 False，等于永不触发")
+
 
 class StartupPathTest(unittest.TestCase):
     """2026-08-08：口径反转时漏改 run_loop 的启动日志，进程起不来。
