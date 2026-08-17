@@ -926,5 +926,52 @@ class DiagnosticSideEffectTest(unittest.TestCase):
         self.assertIs(p.default, True, "默认必须写——只有诊断路径才显式关")
 
 
+class MicrodataRenameTest(unittest.TestCase):
+    """2026-08-14 X 把正文的 itemprop 从 `articleBody` 改名成 `text`。
+
+    ═══ 为什么这次特别糟 ═══
+    抓取日志**一路显示成功**：`看到 5 条`、`已证明无遗漏` 照常打印，账号一个
+    没失败。但连续三天 123 条帖子全部以**空正文**入库 → 分类成噪音 →
+    被 PUSH_BLOCKED 拦掉 → 用户什么都收不到。现有的每一层检查都通过了，
+    因为它们只问"有没有 article"，从不问"有没有内容"。
+
+    而且**入库即不可逆**：post_id 一落库就永久标记"已见过"，之后再也不会
+    重抓。等发现时 196 条的内容已随页面滚走，永久丢失，只补回了 26 条。
+    """
+
+    def test_extract_js_reads_both_field_names(self):
+        src = (Path(__file__).resolve().parent.parent
+               / "x_relay.py").read_text(encoding="utf-8")
+        js = src[src.index("_EXTRACT_JS"):src.index("_EXTRACT_JS") + 2500]
+        self.assertIn("one('text')", js, "改名后的字段必须读")
+        self.assertIn("one('articleBody')", js,
+                      "旧字段也要留着：改名当天两种形态并存，且哪天改回去不该再瞎一次")
+
+
+class AllEmptyBodyIsStructureFailureTest(unittest.TestCase):
+    """拿到帖子但全都没有正文 = 字段又改名了，必须 fail closed 拒绝入库。
+
+    不能只告警了事：空正文一旦入库，那条帖子的内容就永久丢了（见上）。
+    """
+
+    def _fetch_src(self):
+        import inspect
+        return inspect.getsource(x_relay.fetch_account)
+
+    def test_fetch_account_raises_when_all_bodies_empty(self):
+        src = self._fetch_src()
+        self.assertIn("StructureError", src)
+        self.assertIn("没有正文", src, "告警文案要指向真正的原因（字段改名）")
+
+    def test_threshold_tolerates_single_image_only_post(self):
+        """单条纯图帖是正常的，不能因此把整轮判成结构失效。"""
+        src = self._fetch_src()
+        self.assertIn(">= 3", src, "阈值必须 >=3，1 条全空是纯图帖的正常形态")
+
+    def test_pinned_excluded_from_the_check(self):
+        """置顶帖是很旧的一条，不该参与'这一轮有没有内容'的判断。"""
+        self.assertIn("is_pinned", self._fetch_src())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -299,7 +299,11 @@ _EXTRACT_JS = """
   const authorEl = a.querySelector('[itemprop="author"] [itemprop="alternateName"]');
   let post_id = one('identifier');
   let published_at = one('datePublished');
-  let text = one('articleBody');
+  // 2026-08-14 X 把正文的 itemprop 从 `articleBody` 改名成了 `text`。
+  // 两个都读：改名当天页面上两种形态并存（当日入库 187 条里 52% 空正文），
+  // 而且哪天改回去也不至于再瞎一次。**空串要当没有**，否则 `||` 会被
+  // 空的 articleBody 短路掉。
+  let text = one('articleBody') || one('text');
   let author = authorEl ? authorEl.getAttribute('content') : null;
   let n_images = own('image').length +
       a.querySelectorAll('[itemtype*="ImageObject"]').length;
@@ -435,6 +439,21 @@ def fetch_account(ctx, acct: Account, since_id: str | None = None) -> tuple:
         posts = extract_posts(page, acct.handle, rows=rows)
         if not posts:
             raise StructureError(acct.handle)
+        # 拿到帖子、但**全都没有正文** = 微数据字段又被改名了，不是"这些人
+        # 恰好都发了纯图"。必须和"拿不到 article"同等对待，理由是**入库即
+        # 不可逆**：post_id 一旦落库就永久标记为"已见过"，之后再也不会重抓，
+        # 那条帖子的内容就此永久丢失。
+        #
+        # 2026-08-14 实测代价：X 把 `articleBody` 改名为 `text`，抓取日志一路
+        # 显示成功、`已证明无遗漏` 照常打印，而连续三天 123 条帖子全部以空正文
+        # 入库 —— 空正文 → 分类成噪音 → 被 PUSH_BLOCKED 拦掉 → 用户什么都收不到。
+        # 现有的每一层检查都通过了，因为它们只问"有没有 article"，不问"有没有内容"。
+        #
+        # 阈值取 3：单条纯图帖是正常的，一整页 ≥3 条全空不可能是巧合。
+        fresh = [q for q in posts if not q.get("is_pinned")]
+        if len(fresh) >= 3 and not any((q.get("text") or "").strip() for q in fresh):
+            raise StructureError(f"{acct.handle}（{len(fresh)} 条全部没有正文，"
+                                 f"微数据字段可能又改名了）")
         return posts, complete
     finally:
         page.close()
