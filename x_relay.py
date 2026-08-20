@@ -385,78 +385,158 @@ def extract_posts(page, handle: str, rows=None) -> list:
     return out
 
 
-def fetch_account(ctx, acct: Account, since_id: str | None = None) -> tuple:
-    """抓一个账号，**尽量把 since_id 之后的帖子全部取回**。
+# ══════════════════════════════════════════════════════════════════════
+# RSC 路线（2026-08-19 起的唯一抓取路径）
+# ══════════════════════════════════════════════════════════════════════
+# X 从 2026-08-19 开始拦 Playwright/headless Chromium 的浏览器指纹：
+# **全新 profile 也一律 HTTP 403、正文全空**，所以不是 IP 被封、也不是
+# profile 被标记，是浏览器这条路整条不通了。而同一台机器上普通 HTTP GET
+# 仍然 200（Python 默认 UA 就够，不需要伪装成 curl）。
+#
+# curl/urllib 拿到的 HTML **没有 schema.org 微数据**——那是浏览器执行 JS
+# 之后才有的，所以旧的 `_EXTRACT_JS` 那条路在这里用不上。但服务端直接把一份
+# React-Server-Components 的扁平化缓存渲染进了 HTML，帖子字段都在里面：
+#
+#   "client:VHdlZXQ6<b64>:details" : {... created_at_ms:<ms> ... full_text:"<正文>" ...}
+#   "client:VHdlZXQ6<b64>:core"    : {... user_results:{__ref:"VXNlclJlc3VsdHM6<b64uid>"} ...}
+#   "client:VXNlcjo<b64uid>:core"  : {... screen_name:"<作者>" ...}
+#   "client:VHdlZXQ6<b64>:media_entities2:0" : {... media_url_https:"..." ...}
+#   pinned_entry_ids:[...]=["tweet-<id>"]
+#
+# `VHdlZXQ6<b64>` 解码是 `Tweet:<post_id>`，`VXNlcjo<b64>` 解码是 `User:<uid>`。
+# 这条路**比微数据更稳**：它是 X 自己前端要用的数据，不是给爬虫看的附属品。
 
-    返回 `(posts, complete)`：
+X_PROFILE_TIMEOUT = 20
+
+
+def fetch_profile_html(handle: str, timeout: int = X_PROFILE_TIMEOUT) -> str:
+    """取 profile 页 HTML。不开浏览器、不带 cookie、不伪装 UA。"""
+    import urllib.request
+    req = urllib.request.Request(f"https://x.com/{handle}")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        if not (200 <= resp.status < 300):
+            raise StructureError(f"{handle}（HTTP {resp.status}）")
+        return resp.read().decode("utf-8", "replace")
+
+
+def _b64_tail(token: str) -> str:
+    """解 RSC 的 base64 键，返回冒号后那半（`Tweet:123` → `123`）。"""
+    import base64
+    try:
+        d = base64.b64decode(token + "==").decode("utf-8", "replace")
+    except Exception:                                         # noqa: BLE001
+        return ""
+    return d.split(":", 1)[1] if ":" in d else ""
+
+
+def parse_rsc_posts(html: str, handle: str) -> list:
+    """从 RSC 缓存里抽帖子。产出与 `extract_posts` **完全同形**的记录。"""
+    import re as _re
+    # uid → screen_name
+    authors = {}
+    for m in _re.finditer(r'"client:(VXNlcjo[A-Za-z0-9+/=]+):core"\s*:\s*'
+                          r'\$R\[\d+\]\s*=\s*\{(.{0,3000}?)\}', html, _re.S):
+        uid = _b64_tail(m.group(1))
+        sn = _re.search(r'screen_name:"([^"]{1,30})"', m.group(2))
+        if uid and sn:
+            authors[uid] = sn.group(1)
+    # tweet → uid
+    tweet_author = {}
+    for m in _re.finditer(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):core"\s*:\s*'
+                          r'\$R\[\d+\]\s*=\s*\{(.{0,600}?)\}', html, _re.S):
+        tid = _b64_tail(m.group(1))
+        # ⚠️ `VXNlclJlc3VsdHM6...` 是**一整串 base64**（解出来是
+        # `UserResults:<uid>`），不是"前缀 + 后缀"。按文本切开再解码得到的是
+        # 垃圾——第一版就这么写的，结果作者永远解析不出、`is_retweet` 恒为
+        # False，他人帖会被当成账号自己的帖推出去。
+        ref = _re.search(r'__ref:"(VXNlclJlc3VsdHM6[A-Za-z0-9+/=]+)"', m.group(2))
+        if tid and ref:
+            tweet_author[tid] = authors.get(_b64_tail(ref.group(1)), "")
+    # 置顶
+    pinned = set()
+    pm = _re.search(r'pinned_entry_ids:(?:\$R\[\d+\])?=?\[([^\]]*)\]', html)
+    if pm:
+        pinned = set(_re.findall(r'tweet-(\d+)', pm.group(1)))
+    # 带图的 tweet
+    with_media = {_b64_tail(t) for t in
+                  _re.findall(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):media_entities2', html)}
+
+    out, seen = [], set()
+    for m in _re.finditer(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):details"\s*:\s*'
+                          r'\$R\[\d+\]\s*=\s*\{(.{0,4000}?)\}', html, _re.S):
+        pid = _b64_tail(m.group(1))
+        if not pid.isdigit() or pid in seen:
+            continue
+        body = m.group(2)
+        ts = _re.search(r'created_at_ms:(\d{10,16})', body)
+        tx = _re.search(r'full_text:"((?:[^"\\]|\\.)*)"', body)
+        if not ts or not tx:
+            continue
+        seen.add(pid)
+        try:
+            text = json.loads('"' + tx.group(1) + '"')
+        except Exception:                                     # noqa: BLE001
+            text = tx.group(1)
+        published = datetime.fromtimestamp(
+            int(ts.group(1)) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        author = tweet_author.get(pid) or handle
+        out.append({
+            "post_id": pid,
+            "handle": handle,
+            "author": author,
+            "published_at": published,
+            "text": text,
+            "has_image": pid in with_media,
+            # 转发/他人帖：作者与账号不符（大小写不敏感，X 的 screen_name
+            # 大小写与我们配置里写的常常不同）
+            "is_retweet": author.casefold() != handle.casefold(),
+            "is_pinned": pid in pinned,
+            "mode": "rsc",
+        })
+    out.sort(key=lambda r: _snowflake(r["post_id"]), reverse=True)
+    return out
+
+
+def fetch_account(acct: Account, since_id: str | None = None) -> tuple:
+    """抓一个账号。返回 `(posts, complete)`。
+
+    2026-08-19 起走 RSC 路线（普通 HTTP GET + 解析服务端渲染的前端缓存），
+    不再开浏览器——X 已经拦死 Playwright 指纹，全新 profile 也是 403。
+    见 `parse_rsc_posts` 上方那段说明。
+
       · posts    —— 本次看到的全部帖子（含已见过的，去重交给 store）
       · complete —— 是否**证明**没有遗漏。判据只有一个：本次抓到的最旧一条
-                    id ≤ since_id，说明新旧两次的窗口重叠上了，中间不可能有洞。
+                    （排除置顶）id ≤ since_id，说明新旧两次窗口重叠上了。
 
-    下滑只在登录态有效（未登录页固定约 5 条、滚动不加载）。因此未登录时
-    complete 常为 False——那不是 bug，是如实报告"我不能证明没漏"。
-    拿不到任何 article → StructureError。"""
-    page = ctx.new_page()
-    try:
-        page.goto(f"https://x.com/{acct.handle}", timeout=45_000,
-                  wait_until="domcontentloaded")
-        try:
-            # state="attached" 是必须的：微数据是隐藏的 <meta>，默认的
-            # "visible" 永远等不到（2026-08-06 实测把整轮抓取判成结构失效）
-            page.wait_for_selector(
-                'article [itemprop="identifier"], article[data-testid="tweet"]',
-                state="attached", timeout=25_000)
-        except Exception:                                     # noqa: BLE001
-            raise StructureError(acct.handle)
-        page.wait_for_timeout(1200)                           # 让剩余 article 渲染完
+    每页仍然只有约 5 条、没有翻页，所以 complete 靠 15 分钟轮询的窗口重叠
+    来保证；证明不了就如实返回 False，由调用方告警。
+    """
+    html = fetch_profile_html(acct.handle)
+    posts = parse_rsc_posts(html, acct.handle)
+    if not posts:
+        raise StructureError(acct.handle)
 
-        since = _snowflake(since_id) if since_id else -1
-        rows, seen_ids, complete = [], set(), since < 0   # 没有基准线时无需证明
-        budget = MAX_SCROLLS if since >= 0 else BOOTSTRAP_MAX_SCROLLS
-        last_count = -1
-        for attempt in range(budget + 1):
-            for r in page.evaluate(_EXTRACT_JS):
-                pid = r.get("post_id")
-                if pid and pid not in seen_ids:
-                    seen_ids.add(pid)
-                    rows.append(r)
-            # 置顶帖是很旧的一条、且永远在最上面，会让"最旧 id"永远看着已覆盖 →
-            # 判断重叠必须排除它，否则第一屏就假装"抓全了"
-            fresh = [r for r in rows
-                     if not ("Pinned" in (r.get("head") or "")
-                             or "置顶" in (r.get("head") or ""))]
-            if since >= 0 and fresh and min(_snowflake(r["post_id"]) for r in fresh) <= since:
-                complete = True
-                break
-            if len(rows) == last_count:                       # 下滑不再产出新内容
-                break
-            if attempt == budget:                             # 预算用尽，别再翻
-                break
-            last_count = len(rows)
-            page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(SCROLL_WAIT_MS)
+    # 拿到帖子、但**全都没有正文** = 字段又被改名了，不是"这些人恰好都发了纯图"。
+    # 必须和"拿不到帖子"同等对待，理由是**入库即不可逆**：post_id 一旦落库就
+    # 永久标记为"已见过"，之后再也不会重抓，那条帖子的内容就此永久丢失。
+    #
+    # 2026-08-14 实测代价：X 把 `articleBody` 改名为 `text`，抓取日志一路显示
+    # 成功、`已证明无遗漏` 照常打印，而连续三天 123 条帖子全部以空正文入库 ——
+    # 空正文 → 分类成噪音 → 被 PUSH_BLOCKED 拦掉 → 用户什么都收不到。
+    # 当时每一层检查都通过了，因为它们只问"有没有记录"，不问"有没有内容"。
+    #
+    # 阈值取 3：单条纯图帖是正常的，一整页 ≥3 条全空不可能是巧合。
+    fresh = [q for q in posts if not q.get("is_pinned")]
+    if len(fresh) >= 3 and not any((q.get("text") or "").strip() for q in fresh):
+        raise StructureError(f"{acct.handle}（{len(fresh)} 条全部没有正文，"
+                             f"字段可能又改名了）")
 
-        posts = extract_posts(page, acct.handle, rows=rows)
-        if not posts:
-            raise StructureError(acct.handle)
-        # 拿到帖子、但**全都没有正文** = 微数据字段又被改名了，不是"这些人
-        # 恰好都发了纯图"。必须和"拿不到 article"同等对待，理由是**入库即
-        # 不可逆**：post_id 一旦落库就永久标记为"已见过"，之后再也不会重抓，
-        # 那条帖子的内容就此永久丢失。
-        #
-        # 2026-08-14 实测代价：X 把 `articleBody` 改名为 `text`，抓取日志一路
-        # 显示成功、`已证明无遗漏` 照常打印，而连续三天 123 条帖子全部以空正文
-        # 入库 —— 空正文 → 分类成噪音 → 被 PUSH_BLOCKED 拦掉 → 用户什么都收不到。
-        # 现有的每一层检查都通过了，因为它们只问"有没有 article"，不问"有没有内容"。
-        #
-        # 阈值取 3：单条纯图帖是正常的，一整页 ≥3 条全空不可能是巧合。
-        fresh = [q for q in posts if not q.get("is_pinned")]
-        if len(fresh) >= 3 and not any((q.get("text") or "").strip() for q in fresh):
-            raise StructureError(f"{acct.handle}（{len(fresh)} 条全部没有正文，"
-                                 f"微数据字段可能又改名了）")
-        return posts, complete
-    finally:
-        page.close()
+    # 置顶帖是很旧的一条、且永远在最上面，会让"最旧 id"永远看着已覆盖 →
+    # 判断重叠必须排除它，否则第一屏就假装"抓全了"。
+    complete = True
+    if since_id and fresh:
+        complete = min(_snowflake(q["post_id"]) for q in fresh) <= _snowflake(since_id)
+    return posts, complete
 
 
 # ── 推送格式 ────────────────────────────────────────────────
@@ -508,85 +588,80 @@ def should_push(post: dict, cls, now_utc: datetime) -> bool:
 # ── 主流程 ──────────────────────────────────────────────────
 def run_once(store: PostStore, dry_run: bool = False,
              write_hb: bool = True) -> dict:
-    """跑一轮抓取。`write_hb=False` 用于人工一次性诊断（见 main 的 --once）。"""
-    from playwright.sync_api import sync_playwright
+    """跑一轮抓取。`write_hb=False` 用于人工一次性诊断（见 main 的 --once）。
 
+    2026-08-19 起**不再开浏览器**：X 拦死了 Playwright 指纹（全新 profile 也
+    403），改走 RSC 路线的普通 HTTP GET。顺带消掉了一整类问题——不需要
+    persistent context、不需要 profile 目录、不会有 Chromium 进程残留。
+    """
     now_utc = datetime.now(timezone.utc)
     result = {"ok": [], "fail": [], "structure_fail": [], "gap": [],
               "new": 0, "pushed": 0, "logged_in": None}
-    with sync_playwright() as p:
-        ctx = p.chromium.launch_persistent_context(
-            str(PROFILE_DIR), headless=True,
-            viewport={"width": 1280, "height": 2200},
-            args=["--disable-blink-features=AutomationControlled"])
+    for acct in ACCOUNTS:
+        ts = datetime.now(timezone.utc).isoformat()
+        # 增量基准线：上次抓到的最新一条。下滑抓到它就证明没漏。
+        since_id = store.newest_post_id(acct.handle)
         try:
-            for acct in ACCOUNTS:
-                ts = datetime.now(timezone.utc).isoformat()
-                # 增量基准线：上次抓到的最新一条。下滑抓到它就证明没漏。
-                since_id = store.newest_post_id(acct.handle)
-                try:
-                    posts, complete = fetch_account(ctx, acct, since_id=since_id)
-                except StructureError:
-                    result["structure_fail"].append(acct.handle)
-                    store.record_fetch(ts, acct.handle, 0, 0, False, "structure")
-                    log(f"@{acct.handle}: 拿不到微数据（页面结构失效或被拦）")
-                    continue
-                except Exception as e:                        # noqa: BLE001
-                    result["fail"].append(acct.handle)
-                    store.record_fetch(ts, acct.handle, 0, 0, False, str(e)[:200])
-                    log(f"@{acct.handle}: 抓取失败 {e}")
-                    continue
+            posts, complete = fetch_account(acct, since_id=since_id)
+        except StructureError:
+            result["structure_fail"].append(acct.handle)
+            store.record_fetch(ts, acct.handle, 0, 0, False, "structure")
+            log(f"@{acct.handle}: 拿不到帖子（页面结构失效或被拦）")
+            continue
+        except Exception as e:                        # noqa: BLE001
+            result["fail"].append(acct.handle)
+            store.record_fetch(ts, acct.handle, 0, 0, False, str(e)[:200])
+            log(f"@{acct.handle}: 抓取失败 {e}")
+            continue
 
-                n_new = 0
-                for post in posts:
-                    cls = classify_post(post["text"],
-                                        assume_index=acct.assume_index)
-                    post["fetched_at"] = ts
-                    post["classification"] = cls.label
-                    post["levels"] = cls.levels
-                    post["ticker_levels"] = cls.ticker_levels
-                    # dry-run **绝不写库**：否则它会把帖子标成"已见过"，
-                    # 真正的循环之后就再也不会推它们——预览把真实推送吞掉。
-                    # （2026-08-07 实测踩到：一次 --dry-run 吃掉了 10 条新帖。）
-                    if dry_run:
-                        if store.has_post(post["post_id"]):
-                            continue
-                        n_new += 1
-                        if should_push(post, cls, now_utc):
-                            log(f"—— dry-run 应推送 ——\n{format_push(post, cls)}")
-                        continue
-                    if not store.insert_post(post):
-                        continue                              # 已见过（含置顶重复）
-                    n_new += 1
-                    if should_push(post, cls, now_utc):
-                        msg = format_push(post, cls)
-                        if tg_send(msg):
-                            store.mark_pushed(
-                                post["post_id"],
-                                datetime.now(timezone.utc).isoformat())
-                            result["pushed"] += 1
-                        else:
-                            # 失败不丢：计一次尝试，留给本轮末尾的重试队列。
-                            # 2026-08-08 前这里什么都不做，帖子已入库、
-                            # 下轮 insert_post 返回 False 就永久跳过了。
-                            store.bump_attempt(post["post_id"])
-                # 缺口判定（取代早先那个"整页全新"的粗略启发式）：只有当本轮
-                # 抓到的最旧一条 ≤ 上次的最新一条，两次窗口才算重叠、才**证明**
-                # 没漏。证明不了就记为 gap——未登录态因为翻不动页，几乎必然如此。
-                if since_id and not complete:
-                    result["gap"].append(acct.handle)
-                result["ok"].append(acct.handle)
-                result["new"] += n_new
-                if result["logged_in"] is None:
-                    result["logged_in"] = any(p.get("mode") == "testid"
-                                              for p in posts)
-                if not dry_run:
-                    store.record_fetch(ts, acct.handle, len(posts), n_new, True)
-                log(f"@{acct.handle}: 看到 {len(posts)} 条，新 {n_new} 条"
-                    f"{'' if not since_id else (' [已证明无遗漏]' if complete else ' [无法证明无遗漏]')}")
-                time.sleep(random.uniform(*PER_ACCOUNT_DELAY))
-        finally:
-            ctx.close()
+        n_new = 0
+        for post in posts:
+            cls = classify_post(post["text"],
+                                assume_index=acct.assume_index)
+            post["fetched_at"] = ts
+            post["classification"] = cls.label
+            post["levels"] = cls.levels
+            post["ticker_levels"] = cls.ticker_levels
+            # dry-run **绝不写库**：否则它会把帖子标成"已见过"，
+            # 真正的循环之后就再也不会推它们——预览把真实推送吞掉。
+            # （2026-08-07 实测踩到：一次 --dry-run 吃掉了 10 条新帖。）
+            if dry_run:
+                if store.has_post(post["post_id"]):
+                    continue
+                n_new += 1
+                if should_push(post, cls, now_utc):
+                    log(f"—— dry-run 应推送 ——\n{format_push(post, cls)}")
+                continue
+            if not store.insert_post(post):
+                continue                              # 已见过（含置顶重复）
+            n_new += 1
+            if should_push(post, cls, now_utc):
+                msg = format_push(post, cls)
+                if tg_send(msg):
+                    store.mark_pushed(
+                        post["post_id"],
+                        datetime.now(timezone.utc).isoformat())
+                    result["pushed"] += 1
+                else:
+                    # 失败不丢：计一次尝试，留给本轮末尾的重试队列。
+                    # 2026-08-08 前这里什么都不做，帖子已入库、
+                    # 下轮 insert_post 返回 False 就永久跳过了。
+                    store.bump_attempt(post["post_id"])
+        # 缺口判定（取代早先那个"整页全新"的粗略启发式）：只有当本轮
+        # 抓到的最旧一条 ≤ 上次的最新一条，两次窗口才算重叠、才**证明**
+        # 没漏。证明不了就记为 gap——未登录态因为翻不动页，几乎必然如此。
+        if since_id and not complete:
+            result["gap"].append(acct.handle)
+        result["ok"].append(acct.handle)
+        result["new"] += n_new
+        if result["logged_in"] is None:
+            result["logged_in"] = any(p.get("mode") == "testid"
+                                      for p in posts)
+        if not dry_run:
+            store.record_fetch(ts, acct.handle, len(posts), n_new, True)
+        log(f"@{acct.handle}: 看到 {len(posts)} 条，新 {n_new} 条"
+            f"{'' if not since_id else (' [已证明无遗漏]' if complete else ' [无法证明无遗漏]')}")
+        time.sleep(random.uniform(*PER_ACCOUNT_DELAY))
 
     # ── 重试队列：补发此前发送失败的帖 ─────────────────────────
     # 放在抓取循环之后，避免与本轮新帖的推送挤在一起再次撞限流。
