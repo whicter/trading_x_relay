@@ -916,5 +916,81 @@ class AllEmptyBodyIsStructureFailureTest(unittest.TestCase):
         self.assertIn("is_pinned", self._fetch_src())
 
 
+class RscBlockBoundaryTest(unittest.TestCase):
+    """RSC 缓存块的边界必须配平花括号，不能截到第一个 `}`。
+
+    2026-08-27 12:05 ET 八个账号同时"拿不到帖子"的真实形态：抓取全好
+    （HTTP 200、226-270 KB、`:details` 键都在），X 只是把
+    `hashtag_entities`/`cashtag_entities`/`smarttags` 三个 `={...}` 插进了
+    `full_text` 和 `created_at_ms` 中间。原来的 `\{(.{0,4000}?)\}` 停在第一个
+    `}`，于是每个块都只截到 full_text 就没了，`created_at_ms` 拿不到 →
+    六个块全部 `continue` → 0 帖。**字段值一个都没变，只是换了顺序。**
+
+    下面的 fixture 就是当天真实 HTML 的形状（b64 键、$R 编号、字段顺序）。
+    """
+
+    B64 = "VHdlZXQ6MTUzNjA5NDgyODYwNTQxMTMyOQ=="      # Tweet:1536094828605411329
+    PID = "1536094828605411329"
+    UID_B64 = "VXNlcjoxODg1Njg2Nw=="                  # User:18856867
+    REF_B64 = "VXNlclJlc3VsdHM6MTg4NTY4Njc="          # UserResults:18856867
+
+    def _html(self, full_text: str = "hello", between: str = "", tail: str = "") -> str:
+        return (
+            f'"client:{self.UID_B64}:core":$R[30]={{__id:"client:{self.UID_B64}:core",'
+            f'__typename:"UserCore",name:"zerohedge",screen_name:"zerohedge",'
+            f'created_at_ms:1231646938000}},'
+            f'"client:{self.B64}:core":$R[110]={{__id:"client:{self.B64}:core",'
+            f'__typename:"TweetCore",user_results:$R[111]='
+            f'{{__ref:"{self.REF_B64}"}}}},'
+            f'"client:{self.B64}:details":$R[121]={{__id:"client:{self.B64}:details",'
+            f'__typename:"TBirdData",display_text_range:$R[122]=[0,284],'
+            f'full_text:"{full_text}",{between}created_at_ms:1655068521000}}{tail}'
+        )
+
+    def test_fields_separated_by_nested_objects_still_parse(self):
+        """08-27 的直接回归：full_text 与 created_at_ms 之间隔着三层嵌套。"""
+        between = ("hashtag_entities:$R[123]={__refs:$R[124]=[]},"
+                   "cashtag_entities:$R[125]={__refs:$R[126]=[]},"
+                   "smarttags:$R[127]={__refs:$R[128]=[]},")
+        posts = x_relay.parse_rsc_posts(self._html(between=between), "zerohedge")
+        self.assertEqual(len(posts), 1, "嵌套对象夹在中间就丢帖 = 08-27 事故重演")
+        self.assertEqual(posts[0]["post_id"], self.PID)
+        self.assertEqual(posts[0]["text"], "hello")
+        self.assertEqual(posts[0]["author"], "zerohedge")
+        self.assertFalse(posts[0]["is_retweet"])
+
+    def test_nonempty_refs_list_does_not_truncate_the_block(self):
+        """锁死一个**试过但否决**的写法：拿 `,\"client:` 当块分隔符。
+
+        看着干净，但非空 `__refs` 列表内部长得一模一样——带两个以上 hashtag
+        的帖子恰好命中，然后**静默丢帖**。真实样本：
+            __refs:$R[76]=["client:...instructions:0","client:...instructions:1"]
+        """
+        between = ('hashtag_entities:$R[123]={__refs:$R[124]=['
+                   '"client:SGFzaHRhZzox:core","client:SGFzaHRhZzoy:core"]},')
+        posts = x_relay.parse_rsc_posts(self._html(between=between), "zerohedge")
+        self.assertEqual(len(posts), 1, "分隔符切法会在这里丢帖")
+
+    def test_braces_inside_the_post_body_are_not_structure(self):
+        """正文里出现 `{` `}` 是正常的（代码片段、颜文字），不能当块结束。"""
+        posts = x_relay.parse_rsc_posts(
+            self._html(full_text='a } b { c'), "zerohedge")
+        self.assertEqual(len(posts), 1)
+        self.assertEqual(posts[0]["text"], "a } b { c")
+
+    def test_truncated_html_yields_nothing_rather_than_half_a_post(self):
+        """HTML 被截断时宁可一条都不给——半条帖入库即不可逆（见 08-14 空正文）。"""
+        html = self._html()
+        posts = x_relay.parse_rsc_posts(html[:html.index("created_at_ms:16")], "zerohedge")
+        self.assertEqual(posts, [])
+
+    def test_ref_mentions_are_not_mistaken_for_assignments(self):
+        """`__ref:"client:...:details"` 只是引用，不是块，不能当成第二条帖。"""
+        tail = (f',"client:VHdlZXQ6OTk=:core":$R[9]={{legacy:$R[8]='
+                f'{{__ref:"client:{self.B64}:details"}}}}')
+        posts = x_relay.parse_rsc_posts(self._html(tail=tail), "zerohedge")
+        self.assertEqual(len(posts), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

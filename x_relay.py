@@ -428,28 +428,85 @@ def _b64_tail(token: str) -> str:
         return ""
     return d.split(":", 1)[1] if ":" in d else ""
 
+# ── RSC 缓存块的边界 ────────────────────────────────────────────────────
+# 2026-08-27 12:05 ET 起八个账号同时"拿不到帖子"。抓取本身没坏（HTTP 200、
+# 226-270 KB、`:details` 键 18 个都在），坏的是**取块的边界**：原来三条正则
+# 都用 `\{(.{0,N}?)\}` 拿块正文，非贪婪 `?` 会停在**第一个** `}`——这等于
+# 假设"我要的字段之前不会出现嵌套花括号"。当天 X 在 `full_text` 和
+# `created_at_ms` 之间插进了 `hashtag_entities`/`cashtag_entities`/
+# `smarttags`（每个都是 `={__refs:...}`），第一个 `}` 就落在 full_text 之后、
+# created_at_ms 之前 ⇒ 六个块全部只截到一半，`if not ts or not tx: continue`
+# 全数跳过 ⇒ 0 帖 ⇒ 结构失效告警。**字段值一个都没变，只是换了顺序。**
+#
+# 换成配平花括号扫描（并跳过 JSON 字符串，正文里本来就可能有 `{` `}`）。
+# 这样字段怎么重排、中间插多少嵌套对象都无所谓——**这是"再改也不会重演"
+# 与"下次还得再修一遍"的分界**。
+#
+# ⚠️ 试过但否决的写法：以 `,"client:` 作为下一条缓存记录的分隔符来切块。
+# 看着干净，实际会误切——非空的 `__refs` 列表内部就长这样：
+#     __refs:$R[76]=["client:...instructions:0","client:...instructions:1"]
+# 带两个以上 hashtag 的帖子恰好会命中，然后**静默丢帖**。
+_RSC_BLOCK_LIMIT = 200_000
+
+
+def _rsc_block_end(html: str, start: int, limit: int = _RSC_BLOCK_LIMIT) -> int:
+    """`start` 位于开花括号之后；返回与之配对的 `}` 的下标，找不到返回 -1。"""
+    depth, i, n = 1, start, min(len(html), start + limit)
+    while i < n:
+        c = html[i]
+        if c == '"':                      # 整个 JSON 字符串原样跳过
+            i += 1
+            while i < n:
+                if html[i] == "\\":
+                    i += 2
+                    continue
+                if html[i] == '"':
+                    break
+                i += 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _rsc_entries(html: str, prefix: str, suffix: str):
+    """遍历 `"client:<prefix><b64>:<suffix>":$R[n]={...}`，产出 (b64, 块正文)。
+
+    只认**赋值**形式（`={`）；`__ref:"client:...:details"` 那种引用不会命中。
+    """
+    import re as _re
+    pat = _re.compile(r'"client:(' + prefix + r'[A-Za-z0-9+/=]+):'
+                      + suffix + r'"\s*:\s*\$R\[\d+\]\s*=\s*\{')
+    for m in pat.finditer(html):
+        end = _rsc_block_end(html, m.end())
+        if end < 0:                       # 截断的 HTML：宁可少一条，不给半条
+            continue
+        yield m.group(1), html[m.end():end]
+
 
 def parse_rsc_posts(html: str, handle: str) -> list:
     """从 RSC 缓存里抽帖子。产出与 `extract_posts` **完全同形**的记录。"""
     import re as _re
     # uid → screen_name
     authors = {}
-    for m in _re.finditer(r'"client:(VXNlcjo[A-Za-z0-9+/=]+):core"\s*:\s*'
-                          r'\$R\[\d+\]\s*=\s*\{(.{0,3000}?)\}', html, _re.S):
-        uid = _b64_tail(m.group(1))
-        sn = _re.search(r'screen_name:"([^"]{1,30})"', m.group(2))
+    for token, body in _rsc_entries(html, "VXNlcjo", "core"):
+        uid = _b64_tail(token)
+        sn = _re.search(r'screen_name:"([^"]{1,30})"', body)
         if uid and sn:
             authors[uid] = sn.group(1)
     # tweet → uid
     tweet_author = {}
-    for m in _re.finditer(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):core"\s*:\s*'
-                          r'\$R\[\d+\]\s*=\s*\{(.{0,600}?)\}', html, _re.S):
-        tid = _b64_tail(m.group(1))
+    for token, body in _rsc_entries(html, "VHdlZXQ6", "core"):
+        tid = _b64_tail(token)
         # ⚠️ `VXNlclJlc3VsdHM6...` 是**一整串 base64**（解出来是
         # `UserResults:<uid>`），不是"前缀 + 后缀"。按文本切开再解码得到的是
         # 垃圾——第一版就这么写的，结果作者永远解析不出、`is_retweet` 恒为
         # False，他人帖会被当成账号自己的帖推出去。
-        ref = _re.search(r'__ref:"(VXNlclJlc3VsdHM6[A-Za-z0-9+/=]+)"', m.group(2))
+        ref = _re.search(r'__ref:"(VXNlclJlc3VsdHM6[A-Za-z0-9+/=]+)"', body)
         if tid and ref:
             tweet_author[tid] = authors.get(_b64_tail(ref.group(1)), "")
     # 置顶
@@ -462,12 +519,10 @@ def parse_rsc_posts(html: str, handle: str) -> list:
                   _re.findall(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):media_entities2', html)}
 
     out, seen = [], set()
-    for m in _re.finditer(r'"client:(VHdlZXQ6[A-Za-z0-9+/=]+):details"\s*:\s*'
-                          r'\$R\[\d+\]\s*=\s*\{(.{0,4000}?)\}', html, _re.S):
-        pid = _b64_tail(m.group(1))
+    for token, body in _rsc_entries(html, "VHdlZXQ6", "details"):
+        pid = _b64_tail(token)
         if not pid.isdigit() or pid in seen:
             continue
-        body = m.group(2)
         ts = _re.search(r'created_at_ms:(\d{10,16})', body)
         tx = _re.search(r'full_text:"((?:[^"\\]|\\.)*)"', body)
         if not ts or not tx:
