@@ -552,6 +552,68 @@ def parse_rsc_posts(html: str, handle: str) -> list:
     return out
 
 
+# ── 2026-09-24 第三次改版：帖子不再放 `client:<b64>:details` 缓存键，改进 GraphQL 流 ──
+# 22:01 ET 还正常，22:16 起八个账号同时 0 帖。HTTP 200、体积没变，`:details` 键从 18 个变成
+# 0 个；同样的字段（`created_at_ms` / `full_text` / `screen_name` / `media_entities2`）搬进了
+# `GraphQLRequestStream` 的 timeline entries：
+#     $R[n]={content:{__typename:"TimelineTimelineItem",
+#                     client_event_info:{component:"organic_tweets"|"pinned_tweets"},
+#                     content:{tweet_results:{rest_id:"<id>",result:{core:{user_results:{result:{core:{screen_name}}}},
+#                                                                  details:{created_at_ms,full_text},media_entities2:[...]}}}},
+#            entry_id:"tweet-<id>",sort_index:"..."}
+# 三点观察决定了写法：
+#   · result 内键是**字母序**的：core < details < media_entities2 < quoted_status_result，
+#     所以块内第一个 screen_name / created_at_ms / full_text 一定是外层帖子的，不是被引用帖的；
+#     媒体判定要先把 `quoted_status_result` 之后截掉，否则纯文字帖引用了带图帖会误判有图
+#   · 置顶不再有 `pinned_entry_ids`，改看 entry 的 `client_event_info.component == "pinned_tweets"`
+#   · 这条 timeline 叫 `profile_user_originals_timeline`——**只有本人原创**，转发不在里面；
+#     `is_retweet` 仍按作者 ≠ 账号判，保持与旧路线同形
+# 两条路线都保留：先试旧的 `parse_rsc_posts`，0 帖再试这条。X 来回切时不用再改代码。
+def parse_graphql_posts(html: str, handle: str) -> list:
+    """从 GraphQL timeline entries 抽帖子。产出与 `parse_rsc_posts` **完全同形**的记录。"""
+    import re as _re
+    out, seen = [], set()
+    for m in _re.finditer(r'client_event_info:\$R\[\d+\]=\{component:"(pinned_tweets|organic_tweets)"', html):
+        tr = _re.compile(r'tweet_results:\$R\[\d+\]=\{').search(html, m.end())
+        if not tr:
+            continue
+        end = _rsc_block_end(html, tr.end())
+        if end < 0:
+            continue
+        body = html[tr.end():end]
+        pid_m = _re.search(r'rest_id:"(\d+)"', body)
+        if not pid_m or pid_m.group(1) in seen:
+            continue
+        pid = pid_m.group(1)
+        ts = _re.search(r'created_at_ms:(\d{10,16})', body)
+        tx = _re.search(r'full_text:"((?:[^"\\]|\\.)*)"', body)
+        if not ts or not tx:
+            continue
+        seen.add(pid)
+        sn = _re.search(r'screen_name:"([^"]{1,30})"', body)
+        author = sn.group(1) if sn else handle
+        own = body.split("quoted_status_result", 1)[0]
+        has_image = bool(_re.search(r'media_entities2:\$R\[\d+\]=\[\$R', own))
+        try:
+            text = json.loads('"' + tx.group(1) + '"')
+        except Exception:                                     # noqa: BLE001
+            text = tx.group(1)
+        out.append({
+            "post_id": pid,
+            "handle": handle,
+            "author": author,
+            "published_at": datetime.fromtimestamp(
+                int(ts.group(1)) / 1000, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z"),
+            "text": text,
+            "has_image": has_image,
+            "is_retweet": author.casefold() != handle.casefold(),
+            "is_pinned": m.group(1) == "pinned_tweets",
+            "mode": "graphql",
+        })
+    out.sort(key=lambda r: _snowflake(r["post_id"]), reverse=True)
+    return out
+
+
 def fetch_account(acct: Account, since_id: str | None = None) -> tuple:
     """抓一个账号。返回 `(posts, complete)`。
 
@@ -567,7 +629,7 @@ def fetch_account(acct: Account, since_id: str | None = None) -> tuple:
     来保证；证明不了就如实返回 False，由调用方告警。
     """
     html = fetch_profile_html(acct.handle)
-    posts = parse_rsc_posts(html, acct.handle)
+    posts = parse_rsc_posts(html, acct.handle) or parse_graphql_posts(html, acct.handle)
     if not posts:
         raise StructureError(acct.handle)
 

@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -994,3 +995,45 @@ class RscBlockBoundaryTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GraphqlTimelineParseTest(unittest.TestCase):
+    """2026-09-24 第三次改版：`:details` 缓存键消失，帖子搬进 GraphQL timeline entries。"""
+
+    FIX = Path(__file__).resolve().parent / "fixtures" / "graphql_timeline_20260924.html"
+
+    def _html(self):
+        return self.FIX.read_text(encoding="utf-8")
+
+    def test_old_parser_yields_nothing_on_new_format(self):
+        self.assertEqual(x_relay.parse_rsc_posts(self._html(), "AdamMancini4"), [])
+
+    def test_new_parser_extracts_posts_with_pinned_flag(self):
+        ps = x_relay.parse_graphql_posts(self._html(), "AdamMancini4")
+        self.assertEqual(len(ps), 3)
+        self.assertEqual(sum(p["is_pinned"] for p in ps), 1)
+        for p in ps:
+            self.assertTrue(p["post_id"].isdigit())
+            self.assertTrue(p["text"].strip(), "正文不能为空（08-14 教训）")
+            self.assertRegex(p["published_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.000Z$")
+            self.assertEqual(p["author"], "AdamMancini4")
+            self.assertFalse(p["is_retweet"])
+            self.assertEqual(p["mode"], "graphql")
+        ids = [int(p["post_id"]) for p in ps]
+        self.assertEqual(ids, sorted(ids, reverse=True))
+
+    def test_quoted_tweet_does_not_leak_into_outer_post(self):
+        outer = ('client_event_info:$R[1]={component:"organic_tweets"},content:$R[2]={'
+                 'tweet_results:$R[3]={rest_id:"111",result:$R[4]={core:$R[5]={user_results:$R[6]={result:$R[7]={'
+                 'core:$R[8]={screen_name:"me"}}}},details:$R[9]={created_at_ms:1790000000000,full_text:"outer"},'
+                 'quoted_status_result:$R[10]={result:$R[11]={rest_id:"222",core:$R[12]={user_results:$R[13]={result:$R[14]={'
+                 'core:$R[15]={screen_name:"other"}}}},details:$R[16]={created_at_ms:1780000000000,full_text:"inner"},'
+                 'media_entities2:$R[17]=[$R[18]={id_str:"9"}]}}}}}')
+        ps = x_relay.parse_graphql_posts(outer, "me")
+        self.assertEqual([(p["post_id"], p["text"], p["author"], p["has_image"]) for p in ps],
+                         [("111", "outer", "me", False)])
+
+    def test_fetch_account_falls_back_to_graphql(self):
+        with mock.patch.object(x_relay, "fetch_profile_html", return_value=self._html()):
+            posts, complete = x_relay.fetch_account(x_relay.Account("AdamMancini4"), None)
+        self.assertEqual(len(posts), 3)
