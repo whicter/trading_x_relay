@@ -87,18 +87,23 @@ PUSH_RETRY_MAX = 5                 # 单条帖推送失败的最大重试轮数
 # （21 天实测：willem 0.01 帖/小时 vs zerohedge 盘中 7.6 帖/小时）。一律 15 分钟
 # 一轮 = 低频账号白抓、高频账号漏帖（mentoviax 21 次、zerohedge 95 次 gap）。
 # 改为按各账号的**预期发帖率**定间隔：预计新帖填到 FILL_TARGET 个帖位就抓。
-# 总请求量由 HOURLY_FETCH_BUDGET 封顶，与改前（8 账号 × 4 次/小时）持平——
-# 不是多抓，是把低频账号省下的请求挪给高频账号。参数由历史回放定出，见 README。
+# 上限仍是 15 分钟——**任何账号都不比改前慢**：低频账号（Dayu、novicetrader888
+# 等）恰恰是质量最高的，用户明确不接受为省请求把它们放长（2026-10-08）。
+# 所以这是"给高频账号加抓"，总请求量由 HOURLY_FETCH_BUDGET 封顶。
+# 参数由历史回放定出，见 README。
 POLL_MIN_SECONDS = 300             # 再短就是在给 X 的限流送样本
-POLL_MAX_SECONDS = 2700            # 最低频账号也至少 45 分钟看一眼
-# 帖位共约 4 个，目标却只填 0.4 个：发帖是成簇的（mentoviax 均值 3.4 帖/小时，
+POLL_MAX_SECONDS = POLL_SECONDS    # = 改前的固定周期，只许缩短不许放长
+# 帖位共约 4 个，目标却只填 0.75 个：发帖是成簇的（mentoviax 均值 3.4 帖/小时，
 # 但 10 分钟能连发 6 帖），按均值填一半帖位照样撑爆。回放 09-24..10-08 实测
-#（带预算）：1.5 → 24 gap / 估漏 12；0.5 → 7 / 0；0.4 → 4 / 0，均 24 次/小时。
-FILL_TARGET = 0.4
+#（上限 15min、预算 40）：1.5 → 16 gap / 估漏 2；0.75 → 3 / 0、均 34.3 次/小时；
+# 0.4 → 2 / 0 但 36.5 次/小时——差别在噪声内，取请求更少的 0.75。
+FILL_TARGET = 0.75
 RATE_RECENT_HOURS = 2              # 近期发帖率的回看窗口
 RATE_HIST_DAYS = 14                # 同时段历史发帖率的回看天数
-HOURLY_FETCH_BUDGET = 32           # 滚动 1 小时内的抓取次数上限（= 改前的量）
-FAIL_RETRY_SECONDS = POLL_SECONDS  # 抓取失败的账号最迟 15 分钟后重试
+# 滚动 1 小时抓取上限。改前 8 × 4 = 32，而低频账号的 15 分钟必抓就占满 32，
+# 卡在 32 等于高频账号没有加抓余地（回放 24 gap / 估漏 4，等于没修）。
+# 40 留出加抓空间；实际均值 34.3 次/小时（+7%），见 FILL_TARGET。
+HOURLY_FETCH_BUDGET = 40
 
 
 @dataclass
@@ -106,9 +111,6 @@ class Account:
     handle: str
     note: str = ""
     assume_index: bool = False     # 纯数字帖也按指数点位处理（见 classifier）
-    # 自适应间隔的上限。对推送时效敏感的账号压低它，免得"平时发得少"
-    # 被放到 45 分钟一轮、关键点位晚半小时才到。
-    max_interval: int = POLL_MAX_SECONDS
 
 
 # 名单来源：strategy_explore.md §A.4/A.12。内容形态为 2026-08-06 实抓验证，
@@ -116,9 +118,7 @@ class Account:
 ACCOUNTS = [
     # 实测：每 1-2 小时一帖，#ES_F 完整点位（"7741 (hit), 7708 were next down"），
     # 不是「see newsletter」钩子 —— A.12 该项验证通过
-    # max_interval=15 分钟：日内点位时效敏感，自适应只许缩短不许放长（2026-10-08）
-    Account("AdamMancini4", "ES 日内点位（Mancini）", assume_index=True,
-            max_interval=POLL_SECONDS),
+    Account("AdamMancini4", "ES 日内点位（Mancini）", assume_index=True),
     # 实测：$spx/$ndx 波浪 + 明确点位与自报进出场（"short entered at 7789"）
     Account("Investor_Dayu", "波浪理论，喊指数（用户确认 + 实测）", assume_index=True),
     # 实测：中文指数评论，带点位（"ES 8000"、"7660 回撤到 7760"）。中文行文常
@@ -915,29 +915,28 @@ def expected_rate(times: list, now: datetime) -> float:
     return max(recent, hist / days if days else 0.0)
 
 
-def poll_interval(times: list, now: datetime,
-                  max_interval: int = POLL_MAX_SECONDS) -> int:
+def poll_interval(times: list, now: datetime) -> int:
     """下次抓这个账号前该等多少秒：预计新帖填到 FILL_TARGET 个帖位的时间。"""
     rate = expected_rate(times, now)
     if rate <= 0:
-        return max_interval
-    return int(min(max(FILL_TARGET / rate * 3600, POLL_MIN_SECONDS), max_interval))
+        return POLL_MAX_SECONDS
+    return int(min(max(FILL_TARGET / rate * 3600, POLL_MIN_SECONDS), POLL_MAX_SECONDS))
 
 
 class PollScheduler:
     """决定每一拍抓哪些账号。纯逻辑、时间由调用方传入（epoch 秒），便于回放与单测。
 
-    预算（滚动 1 小时 HOURLY_FETCH_BUDGET 次）只压**可推迟**的抓取：到期账号里
-    间隔短（高频）的优先，低频的顺延——它们的帖位够撑好几个小时，晚一拍无害。
-    但一个账号距上次抓取已达它自己的 `max_interval` 时**必抓**，不受预算限制，
-    否则高频账号能把低频账号永久饿死（最坏情况超预算 8 账号 × 4/45min ≈ 11 次/小时）。
+    预算（滚动 1 小时 HOURLY_FETCH_BUDGET 次）只压**加抓**：距上次抓取已满
+    POLL_MAX_SECONDS 的账号**必抓**，不受预算限制——这保证任何账号都不比改前
+    （15 分钟一轮）慢，也保证高频账号不能把低频账号饿死。预算只决定高频账号
+    在两次必抓之间能额外抓几次（间隔短的优先）。
     """
 
     def __init__(self, accounts: list, now: float, seed=None):
         self.accounts = list(accounts)
         self.next_due = {a.handle: now for a in self.accounts}   # 启动时全部到期
         self.last_fetch = {a.handle: None for a in self.accounts}
-        self.interval = {a.handle: a.max_interval for a in self.accounts}
+        self.interval = {a.handle: POLL_MAX_SECONDS for a in self.accounts}
         self.history = []                                       # 本小时内的抓取时刻
         self._rnd = random.Random(seed)
 
@@ -947,7 +946,7 @@ class PollScheduler:
 
         def overdue(a):
             last = self.last_fetch[a.handle]
-            return last is None or now - last >= a.max_interval
+            return last is None or now - last >= POLL_MAX_SECONDS
 
         must = [a for a in ready if overdue(a)]
         rest = sorted((a for a in ready if not overdue(a)),
@@ -970,14 +969,13 @@ class PollScheduler:
 
 def _next_interval(store: PostStore, acct: Account, now_utc: datetime,
                    outcome: str) -> int:
-    """outcome: ok / gap / fail。gap 说明窗口刚被撑爆，立刻按最短间隔追。"""
+    """outcome: ok / gap / fail。gap 说明窗口刚被撑爆，立刻按最短间隔追。
+    失败的账号照常按发帖率排期：上限本就是 15 分钟，停摆告警不会被拖慢。"""
     if outcome == "gap":
         return POLL_MIN_SECONDS
     from datetime import timedelta
     since = (now_utc - timedelta(days=RATE_HIST_DAYS + 1)).isoformat()
-    iv = poll_interval(store.post_times(acct.handle, since), now_utc,
-                       acct.max_interval)
-    return min(iv, FAIL_RETRY_SECONDS) if outcome == "fail" else iv
+    return poll_interval(store.post_times(acct.handle, since), now_utc)
 
 
 def run_loop(store: PostStore):
@@ -986,8 +984,7 @@ def run_loop(store: PostStore):
 
     于是"轮"不再存在，跨轮去抖改为按**账号**计：每个账号记连续失败次数，
     只有**每个**账号都至少连续失败 N 次才算抓取停摆（N 同改前：结构失效 2、
-    其他失败 3）。失败账号最迟 FAIL_RETRY_SECONDS 后重试，所以停摆仍能在
-    约 30 分钟内报出来，不会因为低频账号 45 分钟才抓一次而拖慢。
+    其他失败 3）。每个账号最迟 15 分钟抓一次，所以停摆报出的时间与改前相同。
     """
     log(f"进入轮询循环：自适应间隔 {POLL_MIN_SECONDS}-{POLL_MAX_SECONDS}s，"
         f"预算 {HOURLY_FETCH_BUDGET} 次/小时，{len(ACCOUNTS)} 个账号，"

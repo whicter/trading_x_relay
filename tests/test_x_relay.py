@@ -633,7 +633,7 @@ class StartupPathTest(unittest.TestCase):
         import x_relay
         for sym in ("PUSH_BLOCKED", "PUSH_RETRY_MAX", "PUSH_MAX_AGE_HOURS", "ACCOUNTS",
                     "POLL_MIN_SECONDS", "POLL_MAX_SECONDS", "FILL_TARGET",
-                    "HOURLY_FETCH_BUDGET", "FAIL_RETRY_SECONDS", "PollScheduler"):
+                    "HOURLY_FETCH_BUDGET", "PollScheduler"):
             self.assertTrue(hasattr(x_relay, sym), f"{sym} 未定义")
 
 
@@ -862,8 +862,8 @@ class AdaptivePollTest(unittest.TestCase):
     NOW = datetime(2026, 10, 8, 14, 0, tzinfo=timezone.utc)      # 周四 10:00 ET
 
     @staticmethod
-    def _acct(h, max_interval=x_relay.POLL_MAX_SECONDS):
-        return x_relay.Account(h, max_interval=max_interval)
+    def _acct(h):
+        return x_relay.Account(h)
 
     def test_silent_account_gets_max_interval(self):
         self.assertEqual(x_relay.poll_interval([], self.NOW), x_relay.POLL_MAX_SECONDS)
@@ -872,13 +872,29 @@ class AdaptivePollTest(unittest.TestCase):
         ts = [self.NOW - timedelta(minutes=m) for m in range(110, 0, -5)]   # 12 帖/小时
         self.assertEqual(x_relay.poll_interval(ts, self.NOW), x_relay.POLL_MIN_SECONDS)
 
-    def test_interval_capped_by_account_max(self):
-        """Mancini 这类时效敏感账号：自适应只许缩短，不许放长到 45 分钟。"""
-        self.assertEqual(x_relay.poll_interval([], self.NOW, max_interval=900), 900)
+    def test_no_account_slower_than_before(self):
+        """低频账号（Dayu、novicetrader888…）质量最高，用户明确不接受放长：
+        自适应只许缩短，上限必须等于改前的固定周期。"""
+        self.assertEqual(x_relay.POLL_MAX_SECONDS, x_relay.POLL_SECONDS)
+        self.assertEqual(x_relay.poll_interval([], self.NOW), x_relay.POLL_SECONDS)
 
-    def test_mancini_capped_at_old_cadence(self):
-        m = next(a for a in x_relay.ACCOUNTS if a.handle == "AdamMancini4")
-        self.assertEqual(m.max_interval, x_relay.POLL_SECONDS)
+    def test_every_account_fetched_within_cap_under_full_budget(self):
+        """高频账号把预算吃满时，低频账号仍须每 15 分钟（+抖动）被抓到。"""
+        accts = [self._acct(h) for h in ("q1", "q2", "q3", "busy")]
+        sch = x_relay.PollScheduler(accts, 0.0, seed=1)
+        last, worst, now = {}, 0.0, 0.0
+        while now < 6 * 3600:
+            for a in sch.due(now):
+                if a.handle in last:
+                    worst = max(worst, now - last[a.handle]) if a.handle != "busy" else worst
+                last[a.handle] = now
+                sch.record(a.handle, now, x_relay.POLL_MIN_SECONDS if a.handle == "busy"
+                           else x_relay.POLL_MAX_SECONDS)
+            sch.history += [now] * x_relay.HOURLY_FETCH_BUDGET     # 模拟预算始终被占满
+            now += sch.seconds_until_next(now)
+        for h in ("q1", "q2", "q3"):                 # 算上"之后再也没被抓过"的情况
+            worst = max(worst, now - last[h])
+        self.assertLessEqual(worst, x_relay.POLL_MAX_SECONDS * 1.1 + 60)
 
     def test_history_predicts_the_open(self):
         """开盘前一小时还很安静，但过去同一时段总在爆发 → 必须提前缩短。
@@ -908,7 +924,7 @@ class AdaptivePollTest(unittest.TestCase):
     def test_scheduler_budget_defers_slow_accounts_first(self):
         fast, slow = self._acct("fast"), self._acct("slow")
         sch = x_relay.PollScheduler([slow, fast], 0.0, seed=1)
-        for h, iv in (("fast", 300), ("slow", 2700)):
+        for h, iv in (("fast", 300), ("slow", 900)):
             sch.record(h, 0.0, iv)
         sch.history = [0.0] * (x_relay.HOURLY_FETCH_BUDGET - 1)    # 只剩 1 个名额
         sch.next_due = {"fast": 100.0, "slow": 100.0}
@@ -916,13 +932,13 @@ class AdaptivePollTest(unittest.TestCase):
 
     def test_overdue_account_bypasses_budget(self):
         """预算不能把低频账号永久饿死：到了它自己的上限就必抓。"""
-        fast, slow = self._acct("fast"), self._acct("slow", max_interval=2700)
+        fast, slow = self._acct("fast"), self._acct("slow")
         sch = x_relay.PollScheduler([slow, fast], 0.0, seed=1)
-        sch.record("slow", 0.0, 2700)
-        sch.record("fast", 2500.0, 300)          # fast 刚抓过，未到自己的上限
-        sch.history = [3000.0] * x_relay.HOURLY_FETCH_BUDGET       # 预算已满
-        sch.next_due = {"fast": 2800.0, "slow": 2800.0}
-        self.assertEqual([a.handle for a in sch.due(2800.0)], ["slow"])
+        sch.record("slow", 0.0, 900)
+        sch.record("fast", 600.0, 300)           # fast 刚抓过，未到上限
+        sch.history = [800.0] * x_relay.HOURLY_FETCH_BUDGET        # 预算已满
+        sch.next_due = {"fast": 900.0, "slow": 900.0}
+        self.assertEqual([a.handle for a in sch.due(900.0)], ["slow"])
 
     def test_budget_window_rolls(self):
         a = self._acct("a")
@@ -954,8 +970,8 @@ class AdaptivePollTest(unittest.TestCase):
                          x_relay.POLL_MIN_SECONDS, "刚撑爆窗口 → 立刻按最短间隔追")
         self.assertEqual(x_relay._next_interval(store, acct, self.NOW, "ok"),
                          x_relay.POLL_MAX_SECONDS)
-        self.assertEqual(x_relay._next_interval(store, acct, self.NOW, "fail"),
-                         x_relay.FAIL_RETRY_SECONDS, "失败账号不能等 45 分钟，否则停摆告警被拖慢")
+        self.assertLessEqual(x_relay._next_interval(store, acct, self.NOW, "fail"),
+                             x_relay.POLL_SECONDS, "失败账号最迟 15 分钟重试，停摆告警不能被拖慢")
 
     def test_post_times_excludes_pinned_keeps_retweets(self):
         store = PostStore(Path(tempfile.mkdtemp()) / "t.db")
