@@ -144,6 +144,16 @@ class PostStore:
                           (ts, post_id))
         self.conn.commit()
 
+    def post_times(self, handle: str, since_iso: str) -> list:
+        """该账号 since_iso 之后的发布时间（升序、aware UTC），供自适应轮询估发帖率。
+
+        排除置顶（不占新帖位）；**不**排除转发——转发同样占免登录页的帖位。"""
+        from datetime import datetime
+        rows = self.conn.execute(
+            "SELECT published_at FROM posts WHERE handle=? AND is_pinned=0 "
+            "AND published_at >= ? ORDER BY published_at", (handle, since_iso))
+        return [datetime.fromisoformat(p.replace("Z", "+00:00")) for (p,) in rows]
+
     def record_fetch(self, ts: str, handle: str, n_seen: int, n_new: int,
                      ok: bool, error: str = None):
         self.conn.execute(

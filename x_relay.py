@@ -9,8 +9,8 @@
 author/ImageObject`）——比登录后的 React DOM（`data-testid`）更干净也更稳定，
 因为那是给搜索引擎看的结构化数据。五个账号实测均可拿到最近 1-2 天的帖子。
 好处：无凭据、无账号封禁风险、无 session 过期、无 Google/X 登录反自动化拦截。
-代价：**每账号每轮只能看到约 5 条最新帖，且不能下滑加载更多**——靠 15 分钟
-轮询覆盖；`saturation` 检测负责在可能漏帖时显式告警（见 run_once）。
+代价：**每账号每轮只能看到约 5 条最新帖，且不能下滑加载更多**——靠按账号
+发帖率自适应的轮询覆盖（2026-10-08 前是一律 15 分钟）；`saturation` 检测负责在可能漏帖时显式告警（见 run_once）。
 
 铁律（继承自主仓库讨论记录，不可放宽）：
 - X 内容是**不可信输入**：可推送、可入库打分，**绝不进入任何下单路径**。
@@ -24,7 +24,7 @@ author/ImageObject`）——比登录后的 React DOM（`data-testid`）更干�
 用法：
   venv/bin/python3.11 x_relay.py --once --dry-run # 抓一轮，只打印不推送
   venv/bin/python3.11 x_relay.py --once           # 抓一轮并推送
-  venv/bin/python3.11 x_relay.py --loop           # 常驻轮询（pm2 用这个）
+  venv/bin/python3.11 x_relay.py --loop           # 常驻轮询（pm2 用这个，按账号自适应间隔）
   venv/bin/python3.11 x_relay.py --stats          # 台账分布（含有图无数字占比）
 """
 from __future__ import annotations
@@ -63,8 +63,9 @@ HEARTBEAT_DIR = Path(os.environ.get(
 
 ET = ZoneInfo("America/New_York")
 
-POLL_SECONDS = 900                 # 15 分钟一轮
-JITTER_SECONDS = 120               # ±2 分钟抖动，避免完全规律的访问节奏
+# 改前的固定轮询周期。2026-10-08 起轮询改为按账号自适应（见下方
+# PollScheduler），它仍是：失败重试上限、推送重试队列节奏、Mancini 的间隔上限。
+POLL_SECONDS = 900
 PER_ACCOUNT_DELAY = (4.0, 9.0)     # 账号间随机停顿
 PUSH_MAX_AGE_HOURS = 12            # 只推这么久以内发布的帖（防首轮回填刷屏）
 STRUCTURE_ALERT_COOLDOWN = 6 * 3600   # 页面结构失效告警冷却
@@ -81,12 +82,33 @@ STRUCTURE_ALERT_AFTER = 2
 # 此处不再维护类名清单，避免两处漂移——新增标签只需改 classifier。
 PUSH_RETRY_MAX = 5                 # 单条帖推送失败的最大重试轮数
 
+# ── 自适应轮询（2026-10-08）───────────────────────────────────
+# 免登录页每账号只有约 4 个非置顶帖位，而 8 个账号的发帖率差了几十倍
+# （21 天实测：willem 0.01 帖/小时 vs zerohedge 盘中 7.6 帖/小时）。一律 15 分钟
+# 一轮 = 低频账号白抓、高频账号漏帖（mentoviax 21 次、zerohedge 95 次 gap）。
+# 改为按各账号的**预期发帖率**定间隔：预计新帖填到 FILL_TARGET 个帖位就抓。
+# 总请求量由 HOURLY_FETCH_BUDGET 封顶，与改前（8 账号 × 4 次/小时）持平——
+# 不是多抓，是把低频账号省下的请求挪给高频账号。参数由历史回放定出，见 README。
+POLL_MIN_SECONDS = 300             # 再短就是在给 X 的限流送样本
+POLL_MAX_SECONDS = 2700            # 最低频账号也至少 45 分钟看一眼
+# 帖位共约 4 个，目标却只填 0.4 个：发帖是成簇的（mentoviax 均值 3.4 帖/小时，
+# 但 10 分钟能连发 6 帖），按均值填一半帖位照样撑爆。回放 09-24..10-08 实测
+#（带预算）：1.5 → 24 gap / 估漏 12；0.5 → 7 / 0；0.4 → 4 / 0，均 24 次/小时。
+FILL_TARGET = 0.4
+RATE_RECENT_HOURS = 2              # 近期发帖率的回看窗口
+RATE_HIST_DAYS = 14                # 同时段历史发帖率的回看天数
+HOURLY_FETCH_BUDGET = 32           # 滚动 1 小时内的抓取次数上限（= 改前的量）
+FAIL_RETRY_SECONDS = POLL_SECONDS  # 抓取失败的账号最迟 15 分钟后重试
+
 
 @dataclass
 class Account:
     handle: str
     note: str = ""
     assume_index: bool = False     # 纯数字帖也按指数点位处理（见 classifier）
+    # 自适应间隔的上限。对推送时效敏感的账号压低它，免得"平时发得少"
+    # 被放到 45 分钟一轮、关键点位晚半小时才到。
+    max_interval: int = POLL_MAX_SECONDS
 
 
 # 名单来源：strategy_explore.md §A.4/A.12。内容形态为 2026-08-06 实抓验证，
@@ -94,7 +116,9 @@ class Account:
 ACCOUNTS = [
     # 实测：每 1-2 小时一帖，#ES_F 完整点位（"7741 (hit), 7708 were next down"），
     # 不是「see newsletter」钩子 —— A.12 该项验证通过
-    Account("AdamMancini4", "ES 日内点位（Mancini）", assume_index=True),
+    # max_interval=15 分钟：日内点位时效敏感，自适应只许缩短不许放长（2026-10-08）
+    Account("AdamMancini4", "ES 日内点位（Mancini）", assume_index=True,
+            max_interval=POLL_SECONDS),
     # 实测：$spx/$ndx 波浪 + 明确点位与自报进出场（"short entered at 7789"）
     Account("Investor_Dayu", "波浪理论，喊指数（用户确认 + 实测）", assume_index=True),
     # 实测：中文指数评论，带点位（"ES 8000"、"7660 回撤到 7760"）。中文行文常
@@ -625,7 +649,7 @@ def fetch_account(acct: Account, since_id: str | None = None) -> tuple:
       · complete —— 是否**证明**没有遗漏。判据只有一个：本次抓到的最旧一条
                     （排除置顶）id ≤ since_id，说明新旧两次窗口重叠上了。
 
-    每页仍然只有约 5 条、没有翻页，所以 complete 靠 15 分钟轮询的窗口重叠
+    每页仍然只有约 5 条、没有翻页，所以 complete 靠轮询间隔够短、窗口重叠
     来保证；证明不了就如实返回 False，由调用方告警。
     """
     html = fetch_profile_html(acct.handle)
@@ -703,9 +727,15 @@ def should_push(post: dict, cls, now_utc: datetime) -> bool:
 
 
 # ── 主流程 ──────────────────────────────────────────────────
+_last_retry_at = 0.0               # 推送重试队列上次运行的时刻（epoch 秒）
+
+
 def run_once(store: PostStore, dry_run: bool = False,
-             write_hb: bool = True) -> dict:
+             write_hb: bool = True, accounts: list | None = None) -> dict:
     """跑一轮抓取。`write_hb=False` 用于人工一次性诊断（见 main 的 --once）。
+
+    `accounts` 缺省为整个名单（`--once`）；守护进程只传本拍到期的账号
+    （见 PollScheduler，2026-10-08 起按账号自适应间隔）。
 
     2026-08-19 起**不再开浏览器**：X 拦死了 Playwright 指纹（全新 profile 也
     403），改走 RSC 路线的普通 HTTP GET。顺带消掉了一整类问题——不需要
@@ -714,7 +744,7 @@ def run_once(store: PostStore, dry_run: bool = False,
     now_utc = datetime.now(timezone.utc)
     result = {"ok": [], "fail": [], "structure_fail": [], "gap": [],
               "new": 0, "pushed": 0, "logged_in": None}
-    for acct in ACCOUNTS:
+    for acct in (ACCOUNTS if accounts is None else accounts):
         ts = datetime.now(timezone.utc).isoformat()
         # 增量基准线：上次抓到的最新一条。下滑抓到它就证明没漏。
         since_id = store.newest_post_id(acct.handle)
@@ -782,7 +812,12 @@ def run_once(store: PostStore, dry_run: bool = False,
 
     # ── 重试队列：补发此前发送失败的帖 ─────────────────────────
     # 放在抓取循环之后，避免与本轮新帖的推送挤在一起再次撞限流。
-    if not dry_run:
+    # 按时间节流到每 POLL_SECONDS 一次：自适应轮询后一拍可能只隔一两分钟，
+    # 若每拍都重试，PUSH_RETRY_MAX=5 次会在几分钟内耗尽——TG 短暂故障就会
+    # 变成"已放弃"。保持改前约 75 分钟的重试跨度。
+    global _last_retry_at
+    if not dry_run and time.time() - _last_retry_at >= POLL_SECONDS:
+        _last_retry_at = time.time()
         pending = store.pending_push(
             sorted(PUSH_BLOCKED), PUSH_MAX_AGE_HOURS,
             now_utc.isoformat(), PUSH_RETRY_MAX)
@@ -797,6 +832,7 @@ def run_once(store: PostStore, dry_run: bool = False,
             else:
                 store.bump_attempt(pid)
             time.sleep(1.0)          # 限流是丢帖主因，补发放慢
+    if not dry_run:
         # 重试用尽仍未送达 = 真的丢了，必须让人知道（原来是完全静默的）
         export_for_brief(store)          # 供主仓库简报只读
         gave_up = store.give_up_count(PUSH_RETRY_MAX)
@@ -829,8 +865,9 @@ def run_once(store: PostStore, dry_run: bool = False,
         alert_once("gap_" + ",".join(sorted(result["gap"])),
                    "⚠️ [X中继] 这些账号未能接上上次抓到的最新一条，**可能漏帖**："
                    f"{', '.join(result['gap'])}\n"
-                   "多半是发帖量暴增、超出了免登录页约 5 条的可见窗口；"
-                   "若持续出现，需要缩短轮询间隔或把该账号移出名单。",
+                   "多半是发帖量暴增、超出了免登录页约 5 条的可见窗口。"
+                   "自适应轮询会把它下次的间隔压到最短；若仍持续出现，"
+                   "考虑调低 FILL_TARGET 或把该账号移出名单。",
                    6 * 3600)
     # 心跳的语义是"**守护进程**还活着并在循环"，一次性诊断跑不算。写了会骗人：
     # watchdog 对"pm2 online 但进程卡死"的唯一探测手段就是心跳新鲜度
@@ -850,45 +887,177 @@ def run_once(store: PostStore, dry_run: bool = False,
     return result
 
 
+def expected_rate(times: list, now: datetime) -> float:
+    """该账号此刻的预期发帖率（帖/小时）。`times` 为升序的发布时间（aware）。
+
+    取两者较大值：
+      · 近 RATE_RECENT_HOURS 小时的实际速率 —— 跟上当天的突发；
+      · 过去 RATE_HIST_DAYS 天里**同类日子、同一时刻往后 1 小时**的平均速率
+        —— 只看近期会在开盘那一刻落后：隔夜 1 帖/小时的账号 9:30 突然 4 帖/小时，
+        回看窗口要一个多小时才追上，而那正是撑爆窗口的时段。历史同时段能提前
+        预见"马上要开盘了"。工作日与周末分开算（周末发帖量约为工作日一半）。
+    """
+    import bisect
+    from datetime import timedelta
+
+    def count(a, b):
+        return bisect.bisect_right(times, b) - bisect.bisect_left(times, a)
+
+    recent = count(now - timedelta(hours=RATE_RECENT_HOURS), now) / RATE_RECENT_HOURS
+    weekend = now.astimezone(ET).weekday() >= 5
+    hist, days = 0, 0
+    for d in range(1, RATE_HIST_DAYS + 1):
+        t = now - timedelta(days=d)
+        if (t.astimezone(ET).weekday() >= 5) != weekend:
+            continue
+        hist += count(t, t + timedelta(hours=1))
+        days += 1
+    return max(recent, hist / days if days else 0.0)
+
+
+def poll_interval(times: list, now: datetime,
+                  max_interval: int = POLL_MAX_SECONDS) -> int:
+    """下次抓这个账号前该等多少秒：预计新帖填到 FILL_TARGET 个帖位的时间。"""
+    rate = expected_rate(times, now)
+    if rate <= 0:
+        return max_interval
+    return int(min(max(FILL_TARGET / rate * 3600, POLL_MIN_SECONDS), max_interval))
+
+
+class PollScheduler:
+    """决定每一拍抓哪些账号。纯逻辑、时间由调用方传入（epoch 秒），便于回放与单测。
+
+    预算（滚动 1 小时 HOURLY_FETCH_BUDGET 次）只压**可推迟**的抓取：到期账号里
+    间隔短（高频）的优先，低频的顺延——它们的帖位够撑好几个小时，晚一拍无害。
+    但一个账号距上次抓取已达它自己的 `max_interval` 时**必抓**，不受预算限制，
+    否则高频账号能把低频账号永久饿死（最坏情况超预算 8 账号 × 4/45min ≈ 11 次/小时）。
+    """
+
+    def __init__(self, accounts: list, now: float, seed=None):
+        self.accounts = list(accounts)
+        self.next_due = {a.handle: now for a in self.accounts}   # 启动时全部到期
+        self.last_fetch = {a.handle: None for a in self.accounts}
+        self.interval = {a.handle: a.max_interval for a in self.accounts}
+        self.history = []                                       # 本小时内的抓取时刻
+        self._rnd = random.Random(seed)
+
+    def due(self, now: float) -> list:
+        self.history = [t for t in self.history if now - t < 3600]
+        ready = [a for a in self.accounts if self.next_due[a.handle] <= now]
+
+        def overdue(a):
+            last = self.last_fetch[a.handle]
+            return last is None or now - last >= a.max_interval
+
+        must = [a for a in ready if overdue(a)]
+        rest = sorted((a for a in ready if not overdue(a)),
+                      key=lambda a: self.interval[a.handle])
+        room = max(HOURLY_FETCH_BUDGET - len(self.history) - len(must), 0)
+        chosen = {a.handle for a in must + rest[:room]}
+        return [a for a in self.accounts if a.handle in chosen]   # 保持名单顺序
+
+    def record(self, handle: str, now: float, interval: int):
+        """抓完一次后登记，并排下次。±10% 抖动，避免完全规律的访问节奏。"""
+        self.history.append(now)
+        self.last_fetch[handle] = now
+        self.interval[handle] = interval
+        self.next_due[handle] = now + interval * self._rnd.uniform(0.9, 1.1)
+
+    def seconds_until_next(self, now: float) -> float:
+        """到下一拍要睡多久。有账号因预算被顺延时（next_due 已过）每分钟复查一次。"""
+        return max(min(self.next_due.values()) - now, 60.0)
+
+
+def _next_interval(store: PostStore, acct: Account, now_utc: datetime,
+                   outcome: str) -> int:
+    """outcome: ok / gap / fail。gap 说明窗口刚被撑爆，立刻按最短间隔追。"""
+    if outcome == "gap":
+        return POLL_MIN_SECONDS
+    from datetime import timedelta
+    since = (now_utc - timedelta(days=RATE_HIST_DAYS + 1)).isoformat()
+    iv = poll_interval(store.post_times(acct.handle, since), now_utc,
+                       acct.max_interval)
+    return min(iv, FAIL_RETRY_SECONDS) if outcome == "fail" else iv
+
+
 def run_loop(store: PostStore):
-    log(f"进入轮询循环：每 {POLL_SECONDS}s ±{JITTER_SECONDS}s，"
-        f"{len(ACCOUNTS)} 个账号，拦截类别 {sorted(PUSH_BLOCKED)}（其余全推）")
-    consecutive_all_fail = 0
-    consecutive_structure = 0
+    """常驻轮询。2026-10-08 起每个账号按自己的发帖率定间隔（PollScheduler），
+    不再"每 15 分钟扫一遍全部账号"。
+
+    于是"轮"不再存在，跨轮去抖改为按**账号**计：每个账号记连续失败次数，
+    只有**每个**账号都至少连续失败 N 次才算抓取停摆（N 同改前：结构失效 2、
+    其他失败 3）。失败账号最迟 FAIL_RETRY_SECONDS 后重试，所以停摆仍能在
+    约 30 分钟内报出来，不会因为低频账号 45 分钟才抓一次而拖慢。
+    """
+    log(f"进入轮询循环：自适应间隔 {POLL_MIN_SECONDS}-{POLL_MAX_SECONDS}s，"
+        f"预算 {HOURLY_FETCH_BUDGET} 次/小时，{len(ACCOUNTS)} 个账号，"
+        f"拦截类别 {sorted(PUSH_BLOCKED)}（其余全推）")
+    sched = PollScheduler(ACCOUNTS, time.time())
+    streak = {a.handle: 0 for a in ACCOUNTS}          # 连续失败次数
+    first_fail = {}                                   # 本段连续失败的起点
+    last_kind = {}                                    # structure / fail
+    all_fail_alerted = False
     while True:
-        try:
-            r = run_once(store)
-            if r["structure_fail"] and not r["ok"]:
-                consecutive_structure += 1
-                consecutive_all_fail = 0                      # 归 structure 路径管
-                if consecutive_structure >= STRUCTURE_ALERT_AFTER:
-                    mins = consecutive_structure * POLL_SECONDS // 60
-                    alert_once(
-                        "structure",
-                        f"⚠️ [X中继] 连续 {consecutive_structure} 轮（约 {mins} 分钟）"
-                        "所有账号都拿不到帖子，抓取停摆。\n"
-                        "多半是 X 改版、被反爬拦截，或登录态失效，需人工看 "
-                        "`x_relay.py --once --dry-run` 的输出。",
-                        STRUCTURE_ALERT_COOLDOWN)
-            elif not r["ok"]:
-                consecutive_structure = 0
-                consecutive_all_fail += 1
-                if consecutive_all_fail == ALL_FAIL_ALERT_AFTER:
-                    alert_once("all_fail",
-                               f"⚠️ [X中继] 连续 {consecutive_all_fail} 轮所有账号抓取失败"
-                               "（非登录墙），可能是选择器失效或网络问题，需人工看日志",
-                               3600)
-            else:
+        due = sched.due(time.time())
+        if due:
+            try:
+                r = run_once(store, accounts=due)
+            except Exception as e:                        # noqa: BLE001
+                # 整拍异常（库、导出等）：这批账号按失败处理、照常排期，
+                # 否则它们一直"到期"，每分钟重抓一次，等于在给 X 刷请求。
+                log(f"轮询异常（稍后重试）: {e}")
+                write_heartbeat(ok=False, detail={"error": str(e)[:300]})
+                r = {"ok": [], "fail": [a.handle for a in due],
+                     "structure_fail": [], "gap": []}
+            now = time.time()
+            now_utc = datetime.now(timezone.utc)
+            plan = []
+            for acct in due:
+                h = acct.handle
+                if h in r["ok"]:
+                    streak[h] = 0
+                    first_fail.pop(h, None)
+                    outcome = "gap" if h in r["gap"] else "ok"
+                else:
+                    streak[h] += 1
+                    first_fail.setdefault(h, now)
+                    last_kind[h] = ("structure" if h in r["structure_fail"]
+                                    else "fail")
+                    outcome = "fail"
+                try:
+                    iv = _next_interval(store, acct, now_utc, outcome)
+                except Exception as e:                    # noqa: BLE001
+                    log(f"@{h}: 估算间隔失败，按 {POLL_SECONDS}s 排期: {e}")
+                    iv = POLL_SECONDS
+                sched.record(h, now, iv)
+                plan.append(f"@{h} {iv // 60}m")
+            log("下次间隔：" + "，".join(plan))
+
+            if r["ok"]:
                 # 有账号抓到了 = 抓取通路是好的，哪怕个别账号仍失败。
-                consecutive_structure = 0
-                consecutive_all_fail = 0
+                all_fail_alerted = False
                 resolve_alert(
                     "structure",
-                    f"✅ [X中继] 抓取已恢复：本轮 {len(r['ok'])} 个账号正常拿到帖子。")
-        except Exception as e:                                # noqa: BLE001
-            log(f"轮询异常（下一轮重试）: {e}")
-            write_heartbeat(ok=False, detail={"error": str(e)[:300]})
-        time.sleep(POLL_SECONDS + random.uniform(-JITTER_SECONDS, JITTER_SECONDS))
+                    f"✅ [X中继] 抓取已恢复：本拍 {len(r['ok'])} 个账号正常拿到帖子。")
+            elif all(streak.values()):
+                least = min(streak.values())
+                mins = int(now - min(first_fail.values())) // 60
+                if "structure" in last_kind.values():
+                    if least >= STRUCTURE_ALERT_AFTER:
+                        alert_once(
+                            "structure",
+                            f"⚠️ [X中继] 所有账号连续至少 {least} 次（约 {mins} 分钟）"
+                            "都拿不到帖子，抓取停摆。\n"
+                            "多半是 X 改版、被反爬拦截，或登录态失效，需人工看 "
+                            "`x_relay.py --once --dry-run` 的输出。",
+                            STRUCTURE_ALERT_COOLDOWN)
+                elif least >= ALL_FAIL_ALERT_AFTER and not all_fail_alerted:
+                    all_fail_alerted = True
+                    alert_once("all_fail",
+                               f"⚠️ [X中继] 所有账号连续至少 {least} 次抓取失败"
+                               "（非登录墙），可能是选择器失效或网络问题，需人工看日志",
+                               3600)
+        time.sleep(sched.seconds_until_next(time.time()))
 
 
 def do_login() -> int:

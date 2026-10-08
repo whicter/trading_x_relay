@@ -631,7 +631,9 @@ class StartupPathTest(unittest.TestCase):
     def test_module_level_names_all_resolvable(self):
         """所有模块级引用的自定义常量都必须真的存在。"""
         import x_relay
-        for sym in ("PUSH_BLOCKED", "PUSH_RETRY_MAX", "PUSH_MAX_AGE_HOURS", "ACCOUNTS"):
+        for sym in ("PUSH_BLOCKED", "PUSH_RETRY_MAX", "PUSH_MAX_AGE_HOURS", "ACCOUNTS",
+                    "POLL_MIN_SECONDS", "POLL_MAX_SECONDS", "FILL_TARGET",
+                    "HOURLY_FETCH_BUDGET", "FAIL_RETRY_SECONDS", "PollScheduler"):
             self.assertTrue(hasattr(x_relay, sym), f"{sym} 未定义")
 
 
@@ -702,16 +704,18 @@ class _Stop(BaseException):
 
 
 class _FakeTime:
-    """只替换 x_relay 模块里的 time 引用，不动全局 time 模块。"""
+    """只替换 x_relay 模块里的 time 引用，不动全局 time 模块。sleep 推进时钟。"""
 
     def __init__(self):
+        self.t = 1_800_000_000.0
         self.slept = []
 
     def sleep(self, seconds):
         self.slept.append(seconds)
+        self.t += seconds
 
     def time(self):
-        return 1_800_000_000.0
+        return self.t
 
 
 class StructureAlertTest(unittest.TestCase):
@@ -720,7 +724,10 @@ class StructureAlertTest(unittest.TestCase):
     StructureError 是 25 秒选择器超时抛的——"X 改版了"和"这次页面加载慢"
     产生完全相同的信号，单轮区分不了。当天 10:15 那轮 4 个账号整齐地每
     31 秒失败一个，10:32 全部恢复，此后 12 小时正常；但告警一直挂在手机上，
-    因为压根没有恢复通知。两个缺陷各自都能单独造成误导，分开测。"""
+    因为压根没有恢复通知。两个缺陷各自都能单独造成误导，分开测。
+
+    2026-10-08 起轮询按账号自适应，没有"轮"了：去抖改为按账号连续失败次数。
+    这里的剧本因此也按账号写——`script[i]` 是每个账号第 i 次被抓时的结果。"""
 
     def setUp(self):
         self.dir = tempfile.mkdtemp()
@@ -728,13 +735,13 @@ class StructureAlertTest(unittest.TestCase):
         self.send_ok = True
         self._saved = {k: getattr(x_relay, k) for k in
                        ("ALERT_STATE", "tg_send", "run_once", "write_heartbeat",
-                        "time", "JITTER_SECONDS", "log")}
+                        "time", "log", "_next_interval")}
         x_relay.ALERT_STATE = Path(self.dir) / "alert_state.json"
         x_relay.tg_send = self._tg_send
         x_relay.write_heartbeat = lambda **kw: None
         x_relay.log = lambda *a, **k: None
         x_relay.time = _FakeTime()
-        x_relay.JITTER_SECONDS = 0
+        x_relay._next_interval = lambda store, acct, now, outcome: 900
 
     def tearDown(self):
         for k, v in self._saved.items():
@@ -745,24 +752,30 @@ class StructureAlertTest(unittest.TestCase):
             self.sent.append(text)
         return self.send_ok
 
-    @staticmethod
-    def _ok(n=4):
-        return {"ok": [f"a{i}" for i in range(n)], "fail": [],
-                "structure_fail": [], "gap": [], "new": 0, "pushed": 0}
+    def _drive(self, script, per_account=None):
+        """用真正的 run_loop 跑剧本——测循环本身，不是它的复制品。
 
-    @staticmethod
-    def _struct():
-        return {"ok": [], "fail": [], "structure_fail": ["a0", "a1"],
-                "gap": [], "new": 0, "pushed": 0}
+        script: 结果序列，元素为 "ok" / "struct" / "fail" / "raise"；
+        per_account: {handle: 另一份剧本}，覆盖该账号的默认剧本。"""
+        per_account = per_account or {}
+        n = {}
 
-    def _drive(self, rounds):
-        """用真正的 run_loop 跑给定轮次——测循环本身，不是它的复制品。"""
-        seq = list(rounds)
-
-        def fake_run_once(store, dry_run=False):
-            if not seq:
-                raise _Stop()
-            return seq.pop(0)
+        def fake_run_once(store, dry_run=False, write_hb=True, accounts=None):
+            r = {"ok": [], "fail": [], "structure_fail": [], "gap": [],
+                 "new": 0, "pushed": 0}
+            outs = []
+            for a in accounts:
+                seq = per_account.get(a.handle, script)
+                i = n.get(a.handle, 0)
+                if i >= len(seq):
+                    raise _Stop()
+                n[a.handle] = i + 1
+                outs.append((a.handle, seq[i]))
+            if any(o == "raise" for _, o in outs):
+                raise RuntimeError("整拍异常")
+            for h, o in outs:
+                r[{"ok": "ok", "struct": "structure_fail", "fail": "fail"}[o]].append(h)
+            return r
 
         x_relay.run_once = fake_run_once
         try:
@@ -778,17 +791,18 @@ class StructureAlertTest(unittest.TestCase):
 
     def test_single_round_does_not_alert(self):
         """就是 08-09 那次误报的直接回归：一轮全灭 + 下轮恢复 = 不该告警。"""
-        self._drive([self._struct(), self._ok()])
+        self._drive(["struct", "ok"])
         self.assertEqual(self._alerts(), [], "单轮抖动不能报「抓取停摆」")
         self.assertEqual(self._recoveries(), [], "没告警过就不该发恢复通知")
 
     def test_two_consecutive_rounds_alert(self):
-        self._drive([self._struct(), self._struct()])
-        self.assertEqual(len(self._alerts()), 1, "连续两轮全灭必须告警一次")
-        self.assertIn("30 分钟", self._alerts()[0], "告警要说明已持续多久")
+        self._drive(["struct", "struct"])
+        self.assertEqual(len(self._alerts()), 1, "每个账号连续两次全灭必须告警一次")
+        self.assertIn("至少 2 次", self._alerts()[0])
+        self.assertRegex(self._alerts()[0], r"约 1[3-9] 分钟", "告警要说明已持续多久")
 
     def test_recovery_notifies_once_and_clears_state(self):
-        self._drive([self._struct(), self._struct(), self._ok(), self._ok()])
+        self._drive(["struct", "struct", "ok", "ok"])
         self.assertEqual(len(self._alerts()), 1)
         self.assertEqual(len(self._recoveries()), 1, "恢复只通知一次，不能每轮刷")
         state = json.loads(x_relay.ALERT_STATE.read_text())
@@ -797,10 +811,20 @@ class StructureAlertTest(unittest.TestCase):
 
     def test_partial_success_is_healthy(self):
         """个别账号失败但有账号抓到 = 抓取通路是好的，不是停摆。"""
-        partial = {"ok": ["a0"], "fail": [], "structure_fail": ["a1"],
-                   "gap": [], "new": 0, "pushed": 0}
-        self._drive([partial, partial, partial])
+        self._drive(["struct"] * 4, per_account={"zerohedge": ["ok"] * 4})
         self.assertEqual(self._alerts(), [])
+
+    def test_all_fail_alerts_once(self):
+        self._drive(["fail"] * 6)
+        alerts = [m for m in self.sent if "抓取失败" in m]
+        self.assertEqual(len(alerts), 1, "非结构性全灭：到阈值报一次，之后不再每拍刷")
+
+    def test_crashed_tick_still_schedules(self):
+        """整拍异常时这批账号也必须排期——否则它们一直到期，每分钟重抓一次。"""
+        self._drive(["raise", "ok"])
+        self.assertGreaterEqual(max(x_relay.time.slept), 800,
+                                "异常后应按失败重试间隔等待，而不是 60 秒就重来")
+        self.assertNotIn(60.0, x_relay.time.slept[:1])
 
     def test_failed_send_keeps_alert_state(self):
         """恢复通知发不出去时不能清状态——否则这条事实被静默丢掉。"""
@@ -826,6 +850,157 @@ class StructureAlertTest(unittest.TestCase):
                 and c.args and isinstance(c.args[0], ast.Constant)]
         self.assertNotIn("structure", keys,
                          "结构失效告警需要跨轮去抖，必须留在 run_loop")
+
+
+class AdaptivePollTest(unittest.TestCase):
+    """2026-10-08：按账号发帖率自适应轮询（取代一律 15 分钟）。
+
+    起因：mentoviax 从 08-11 实测的 2.7 小时一帖涨到工作日 45-51 帖/天，
+    免登录页只有约 4 个非置顶帖位，15 分钟一轮接不上（21 次 gap），
+    zerohedge 更甚（95 次）；而另外 5 个账号 15 分钟一抓几乎全是"新 0 条"。"""
+
+    NOW = datetime(2026, 10, 8, 14, 0, tzinfo=timezone.utc)      # 周四 10:00 ET
+
+    @staticmethod
+    def _acct(h, max_interval=x_relay.POLL_MAX_SECONDS):
+        return x_relay.Account(h, max_interval=max_interval)
+
+    def test_silent_account_gets_max_interval(self):
+        self.assertEqual(x_relay.poll_interval([], self.NOW), x_relay.POLL_MAX_SECONDS)
+
+    def test_busy_account_gets_min_interval(self):
+        ts = [self.NOW - timedelta(minutes=m) for m in range(110, 0, -5)]   # 12 帖/小时
+        self.assertEqual(x_relay.poll_interval(ts, self.NOW), x_relay.POLL_MIN_SECONDS)
+
+    def test_interval_capped_by_account_max(self):
+        """Mancini 这类时效敏感账号：自适应只许缩短，不许放长到 45 分钟。"""
+        self.assertEqual(x_relay.poll_interval([], self.NOW, max_interval=900), 900)
+
+    def test_mancini_capped_at_old_cadence(self):
+        m = next(a for a in x_relay.ACCOUNTS if a.handle == "AdamMancini4")
+        self.assertEqual(m.max_interval, x_relay.POLL_SECONDS)
+
+    def test_history_predicts_the_open(self):
+        """开盘前一小时还很安静，但过去同一时段总在爆发 → 必须提前缩短。
+
+        只看近 2 小时会在 9:30 那一刻落后一个多小时，而那正是撑爆窗口的时段。"""
+        ts = []
+        for d in range(1, 15):
+            day = self.NOW - timedelta(days=d)
+            if day.astimezone(x_relay.ET).weekday() < 5:
+                ts += [day + timedelta(minutes=m) for m in range(0, 60, 6)]  # 10 帖/小时
+        ts.sort()
+        quiet_now = [t for t in ts if t < self.NOW - timedelta(hours=2)]  # 近 2h 无帖
+        self.assertGreaterEqual(x_relay.expected_rate(quiet_now, self.NOW), 9.0)
+        ts = quiet_now
+        self.assertEqual(x_relay.poll_interval(ts, self.NOW), x_relay.POLL_MIN_SECONDS)
+
+    def test_weekend_history_not_mixed_with_weekdays(self):
+        ts = []
+        for d in range(1, 15):
+            day = self.NOW - timedelta(days=d)
+            if day.astimezone(x_relay.ET).weekday() < 5:
+                ts += [day + timedelta(minutes=m) for m in range(0, 60, 6)]
+        ts.sort()
+        saturday = datetime(2026, 10, 10, 14, 0, tzinfo=timezone.utc)
+        self.assertEqual(x_relay.expected_rate(ts, saturday), 0.0)
+
+    def test_scheduler_budget_defers_slow_accounts_first(self):
+        fast, slow = self._acct("fast"), self._acct("slow")
+        sch = x_relay.PollScheduler([slow, fast], 0.0, seed=1)
+        for h, iv in (("fast", 300), ("slow", 2700)):
+            sch.record(h, 0.0, iv)
+        sch.history = [0.0] * (x_relay.HOURLY_FETCH_BUDGET - 1)    # 只剩 1 个名额
+        sch.next_due = {"fast": 100.0, "slow": 100.0}
+        self.assertEqual([a.handle for a in sch.due(200.0)], ["fast"])
+
+    def test_overdue_account_bypasses_budget(self):
+        """预算不能把低频账号永久饿死：到了它自己的上限就必抓。"""
+        fast, slow = self._acct("fast"), self._acct("slow", max_interval=2700)
+        sch = x_relay.PollScheduler([slow, fast], 0.0, seed=1)
+        sch.record("slow", 0.0, 2700)
+        sch.record("fast", 2500.0, 300)          # fast 刚抓过，未到自己的上限
+        sch.history = [3000.0] * x_relay.HOURLY_FETCH_BUDGET       # 预算已满
+        sch.next_due = {"fast": 2800.0, "slow": 2800.0}
+        self.assertEqual([a.handle for a in sch.due(2800.0)], ["slow"])
+
+    def test_budget_window_rolls(self):
+        a = self._acct("a")
+        sch = x_relay.PollScheduler([a], 0.0, seed=1)
+        sch.record("a", 0.0, 300)
+        sch.history = [0.0] * x_relay.HOURLY_FETCH_BUDGET
+        sch.next_due = {"a": 0.0}
+        self.assertEqual(sch.due(100.0), [])
+        self.assertEqual([x.handle for x in sch.due(3601.0)], ["a"])
+
+    def test_startup_fetches_everyone(self):
+        sch = x_relay.PollScheduler(x_relay.ACCOUNTS, 0.0)
+        self.assertEqual(sch.due(0.0), list(x_relay.ACCOUNTS))
+
+    def test_jitter_within_ten_percent(self):
+        sch = x_relay.PollScheduler([self._acct("a")], 0.0, seed=1)
+        for i in range(50):
+            sch.record("a", 0.0, 1000)
+            self.assertTrue(900 <= sch.next_due["a"] <= 1100)
+
+    def test_sleep_floor_when_deferred(self):
+        sch = x_relay.PollScheduler([self._acct("a")], 0.0)
+        self.assertEqual(sch.seconds_until_next(500.0), 60.0)
+
+    def test_next_interval_outcomes(self):
+        store = PostStore(Path(tempfile.mkdtemp()) / "t.db")
+        acct = self._acct("a")
+        self.assertEqual(x_relay._next_interval(store, acct, self.NOW, "gap"),
+                         x_relay.POLL_MIN_SECONDS, "刚撑爆窗口 → 立刻按最短间隔追")
+        self.assertEqual(x_relay._next_interval(store, acct, self.NOW, "ok"),
+                         x_relay.POLL_MAX_SECONDS)
+        self.assertEqual(x_relay._next_interval(store, acct, self.NOW, "fail"),
+                         x_relay.FAIL_RETRY_SECONDS, "失败账号不能等 45 分钟，否则停摆告警被拖慢")
+
+    def test_post_times_excludes_pinned_keeps_retweets(self):
+        store = PostStore(Path(tempfile.mkdtemp()) / "t.db")
+        base = {"handle": "a", "fetched_at": "2026-10-08T14:00:00+00:00",
+                "text": "x", "has_image": False, "classification": "other",
+                "levels": [], "ticker_levels": {}}
+        store.insert_post({**base, "post_id": "1", "author": "a", "is_retweet": False,
+                           "is_pinned": True, "published_at": "2026-10-08T13:00:00.000Z"})
+        store.insert_post({**base, "post_id": "2", "author": "b", "is_retweet": True,
+                           "is_pinned": False, "published_at": "2026-10-08T13:10:00.000Z"})
+        store.insert_post({**base, "post_id": "3", "author": "a", "is_retweet": False,
+                           "is_pinned": False, "published_at": "2026-10-08T13:05:00.000Z"})
+        ts = store.post_times("a", "2026-10-01T00:00:00+00:00")
+        self.assertEqual([t.minute for t in ts], [5, 10], "置顶不占新帖位、转发占；须升序")
+
+
+class RetryQueueThrottleTest(unittest.TestCase):
+    """自适应轮询一拍可能只隔一两分钟；推送重试队列若每拍都跑，
+    PUSH_RETRY_MAX=5 会在几分钟内耗尽，TG 短暂故障就变成"已放弃"。"""
+
+    def test_retry_queue_runs_at_most_once_per_poll_seconds(self):
+        calls = []
+
+        class FakeStore:
+            def pending_push(self, *a):
+                calls.append(1)
+                return []
+
+            def give_up_count(self, n):
+                return 0
+
+        saved = {k: getattr(x_relay, k) for k in
+                 ("time", "export_for_brief", "write_heartbeat", "_last_retry_at")}
+        try:
+            x_relay.time = _FakeTime()
+            x_relay.export_for_brief = lambda store: None
+            x_relay.write_heartbeat = lambda **kw: None
+            x_relay._last_retry_at = 0.0
+            for dt in (0, 120, 120, 700):          # 累计 0 / 120 / 240 / 940 秒
+                x_relay.time.t += dt
+                x_relay.run_once(FakeStore(), accounts=[])
+            self.assertEqual(len(calls), 2, "940 秒内只该跑两次（0s 与 940s）")
+        finally:
+            for k, v in saved.items():
+                setattr(x_relay, k, v)
 
 
 class DiagnosticSideEffectTest(unittest.TestCase):
