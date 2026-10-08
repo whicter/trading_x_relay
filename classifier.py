@@ -126,6 +126,10 @@ _CHATTER_CN = ("不作为任何投资建议", "盈亏自负", "没有任何群�
 _NUMBER = re.compile(
     r"(?<![\d.,:%$/])(\d{1,2},\d{3}(?:\.\d+)?|\d{2,5}(?:\.\d+)?)"
     r"(?!\d)(?!,\d)(?!\s?%)(?!:)(?!/\d)")
+# 链接不是正文：2026-10-08 实测 mentoviax「$GOOGL https://t.co/gQsPQ02sTI」
+# 把短链里的 `02` 抽成了点位 2 并绑到 $GOOGL 上推了出去。t.co 短链几乎每条带图/
+# 带链帖都有，且常含数字，必须在抽数字与判关键词**之前**整段去掉。
+_URL = re.compile(r"https?://\S+")
 # 波浪序号：wave-3 / wave 4 / 第3浪 / 3 waves —— 这些数字不是点位
 _WAVE_ORDINAL = re.compile(r"(?i)(wave[-\s]?\d{1,2}|\d{1,2}[-\s]?waves?|第\s?\d{1,2}\s?浪|\d{1,2}\s?浪)")
 
@@ -176,6 +180,7 @@ class Classification:
 
 
 def _extract_levels(text: str, lo: float = LEVEL_MIN, hi: float = LEVEL_MAX) -> list:
+    text = _URL.sub(" URL ", text)                # 短链里的数字不是点位
     text = _INDEX_NAME_NUM.sub(" INDEXNAME ", text)
     text = _WAVE_ORDINAL.sub(" WAVE ", text)      # 浪序号不是点位
     out = []
@@ -261,7 +266,7 @@ def _hit(pattern, cn_words, text: str) -> bool:
 def classify_post(text: str, assume_index: bool = False) -> Classification:
     """text → Classification。assume_index 见模块 docstring。"""
     # X 微数据里 & 是双重编码（实测 "S&amp;P 500"），不解码则 s&p 关键词失效
-    text = _html.unescape(text or "")
+    text = _URL.sub(" URL ", _html.unescape(text or ""))
     stock = _stock_signals(text)
     is_index = _has_index_keyword(text)
     levels = _extract_levels(text)

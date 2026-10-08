@@ -852,6 +852,26 @@ class StructureAlertTest(unittest.TestCase):
                          "结构失效告警需要跨轮去抖，必须留在 run_loop")
 
 
+class UrlIsNotLevelTest(unittest.TestCase):
+    """2026-10-08 实推：「$GOOGL https://t.co/gQsPQ02sTI」推出了 `📍 $GOOGL 2`。"""
+
+    REAL = "Elon was clearly bored..... lol\n\n$TSLA $NVDA $GOOGL https://t.co/gQsPQ02sTI"
+
+    def test_real_mentoviax_post_has_no_levels(self):
+        c = classify_post(self.REAL)
+        self.assertEqual(c.label, "stock", "去链接不能改变分类")
+        self.assertEqual(c.levels, [])
+        self.assertEqual(c.ticker_levels, {})
+
+    def test_real_level_next_to_link_survives(self):
+        c = classify_post("$MU key today is to take 1083 key resistance https://t.co/x1234ab")
+        self.assertEqual(c.ticker_levels.get("MU"), [1083.0])
+
+    def test_extract_ticker_levels_direct_call_also_strips(self):
+        from classifier import extract_ticker_levels
+        self.assertEqual(extract_ticker_levels("$GOOGL https://t.co/gQsPQ02sTI"), {})
+
+
 class AdaptivePollTest(unittest.TestCase):
     """2026-10-08：按账号发帖率自适应轮询（取代一律 15 分钟）。
 
