@@ -30,12 +30,15 @@ author/ImageObject`）——比登录后的 React DOM（`data-testid`）更干�
 from __future__ import annotations
 
 import argparse
+import html
 import json
+import re
 import os
 import random
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -166,19 +169,31 @@ def resolve_tg():
     return (token, chat) if token and chat else (None, None)
 
 
-def tg_send(text: str) -> bool:
+def tg_send(text: str, plain_fallback: str | None = None) -> bool:
+    """发一条 TG 消息。给了 `plain_fallback` 就按 HTML 解析发 `text`。
+
+    HTML 被 Telegram 拒收（400：标签不合法/转义漏了）时**立刻改发纯文本**，
+    不进重试队列——格式错误重试多少次都一样错，那条帖子会被耗到"已放弃"。
+    网络/限流类失败仍返回 False，交给重试队列。"""
     token, chat = resolve_tg()
     if not token:
         log("TG 未配置（缺 TG_TOKEN/TG_CHAT_ID），本条只落库不推送")
         return False
+    fields = {"chat_id": chat, "text": text, "disable_web_page_preview": "true"}
+    if plain_fallback is not None:
+        fields["parse_mode"] = "HTML"
     try:
-        data = urllib.parse.urlencode({
-            "chat_id": chat, "text": text,
-            "disable_web_page_preview": "true"}).encode()
         req = urllib.request.Request(
-            f"https://api.telegram.org/bot{token}/sendMessage", data=data)
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=urllib.parse.urlencode(fields).encode())
         with urllib.request.urlopen(req, timeout=15) as resp:
             return 200 <= resp.status < 300
+    except urllib.error.HTTPError as e:
+        if e.code == 400 and plain_fallback is not None:
+            log(f"TG 拒收 HTML（{e}），改发纯文本")
+            return tg_send(plain_fallback)
+        log(f"TG 发送失败: {e}")
+        return False
     except Exception as e:                                    # noqa: BLE001
         log(f"TG 发送失败: {e}")
         return False
@@ -682,33 +697,101 @@ def fetch_account(acct: Account, since_id: str | None = None) -> tuple:
 
 # ── 推送格式 ────────────────────────────────────────────────
 CLASS_CN = {"index_levels": "指数点位", "index_view": "指数观点",
-            "stock": "个股", "other": "其他"}
+            "stock": "个股", "commodity": "商品", "crypto": "加密",
+            "macro": "宏观", "other": "其他"}
 
 
-def format_push(post: dict, cls) -> str:
-    when = ""
+# 2026-10-08 起推送用 Telegram HTML 排版（账号加粗、正文进引用块、长帖折叠、
+# 原帖链接收成一个"原帖 ↗"）。旧的纯文本格式保留为 format_push_plain，
+# 仅在 Telegram 拒收 HTML 时兜底，以及 dry-run 日志里用。
+_TCO = re.compile(r"\s*https?://t\.co/\S+")
+FOLD_CHARS = 300                   # 正文超过这么长就折叠，免得一条占满一屏
+BODY_MAX_CHARS = 2000              # Telegram 单条上限 4096，留足余量
+
+
+def _when(post: dict) -> str:
     if post.get("published_at"):
         try:
             dt = datetime.fromisoformat(post["published_at"].replace("Z", "+00:00"))
-            when = f" · {dt.astimezone(ET):%m-%d %H:%M} ET"
+            return f"{dt.astimezone(ET):%m-%d %H:%M} ET"
         except ValueError:
             pass
-    lines = [f"📡 [X·{CLASS_CN.get(cls.label, cls.label)}] @{post['handle']}{when}"]
-    text = (post.get("text") or "").strip()
-    lines.append(text[:900] + ("…" if len(text) > 900 else ""))
+    return ""
+
+
+def _body(post: dict) -> str:
+    """正文：还原 X 的 HTML 实体、去掉 t.co 短链。
+
+    `&` 在微数据/缓存里是编码过的（`S&amp;P 500`）——分类器读的时候会还原，
+    推送这边一直没还原，2026-10-08 前用户看到的就是字面的 `S&amp;P`。
+    t.co 只是图片/外链的跳转地址，原帖链接另有一行，留着纯属噪音。"""
+    text = _TCO.sub("", html.unescape(post.get("text") or ""))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _fmt_level(v: float) -> str:
+    return f"{v:,.10g}"
+
+
+def _level_parts(cls) -> tuple:
+    """返回 [(标的或 None, [点位串])]：标的绑定优先，否则一组扁平点位。"""
     tl = getattr(cls, "ticker_levels", None) or {}
     named = {k: v for k, v in tl.items() if k != "_lead"}
     if named:
         # 标的绑定优先：「$aaoi 149/160/170　$axti 89」比一串分不清归属的数字有用
+        return [(k, [_fmt_level(v) for v in vs[:6]]) for k, vs in list(named.items())[:6]]
+    if cls.levels:
+        return [(None, [_fmt_level(v) for v in cls.levels[:12]])]
+    return []
+
+
+def format_push(post: dict, cls) -> str:
+    """推送正文（Telegram HTML）。所有来自帖子的文字一律 html.escape。"""
+    esc = lambda t: html.escape(t, quote=False)               # noqa: E731
+    handle = post["handle"]
+    url = f"https://x.com/{handle}/status/{post['post_id']}"
+    # 账号名做成指向 X 主页的链接：裸写 @handle 会被 Telegram 当成**TG 用户名**
+    # 自动加链接，点过去是一个毫不相干的 Telegram 账号。
+    lines = [f'<b><a href="https://x.com/{handle}">@{esc(handle)}</a></b>'
+             f"  #{esc(CLASS_CN.get(cls.label, cls.label))}"]
+    when = _when(post)
+    lines.append((f"{when} · " if when else "") + f'<a href="{url}">原帖 ↗</a>')
+    body = _body(post)
+    if body:
+        if len(body) > BODY_MAX_CHARS:
+            body = body[:BODY_MAX_CHARS] + "…"
+        tag = "blockquote expandable" if len(body) > FOLD_CHARS else "blockquote"
+        lines.append(f"<{tag}>{esc(body)}</blockquote>")
+    parts = _level_parts(cls)
+    if parts:
         lines.append("📍 " + "　".join(
-            f"${k} {'/'.join(f'{v:,.10g}' for v in vs[:6])}"
-            for k, vs in list(named.items())[:6]))
-    elif cls.levels:
-        lines.append("📍 " + ", ".join(f"{v:,.10g}" for v in cls.levels[:12]))
+            (f"<b>${esc(k)}</b> " if k else "") + f"<code>{'/'.join(vs) if k else ', '.join(vs)}</code>"
+            for k, vs in parts))
+    if post.get("has_image") and not cls.levels:
+        lines.append("🖼 帖内含图（点位可能在图中，文本未抽出数字）")
+    return "\n".join(lines)
+
+
+def format_push_plain(post: dict, cls) -> str:
+    """纯文本版（HTML 被拒收时的兜底、dry-run 日志）。与 format_push 同内容。"""
+    when = _when(post)
+    lines = [f"📡 [X·{CLASS_CN.get(cls.label, cls.label)}] @{post['handle']}"
+             + (f" · {when}" if when else "")]
+    body = _body(post)
+    if body:
+        lines.append(body[:900] + ("…" if len(body) > 900 else ""))
+    parts = _level_parts(cls)
+    if parts:
+        lines.append("📍 " + "　".join(
+            (f"${k} {'/'.join(vs)}" if k else ", ".join(vs)) for k, vs in parts))
     if post.get("has_image") and not cls.levels:
         lines.append("🖼 帖内含图（点位可能在图中，文本未抽出数字）")
     lines.append(f"🔗 x.com/{post['handle']}/status/{post['post_id']}")
     return "\n".join(lines)
+
+
+def push_post(post: dict, cls) -> bool:
+    return tg_send(format_push(post, cls), plain_fallback=format_push_plain(post, cls))
 
 
 def should_push(post: dict, cls, now_utc: datetime) -> bool:
@@ -777,14 +860,13 @@ def run_once(store: PostStore, dry_run: bool = False,
                     continue
                 n_new += 1
                 if should_push(post, cls, now_utc):
-                    log(f"—— dry-run 应推送 ——\n{format_push(post, cls)}")
+                    log(f"—— dry-run 应推送 ——\n{format_push_plain(post, cls)}")
                 continue
             if not store.insert_post(post):
                 continue                              # 已见过（含置顶重复）
             n_new += 1
             if should_push(post, cls, now_utc):
-                msg = format_push(post, cls)
-                if tg_send(msg):
+                if push_post(post, cls):
                     store.mark_pushed(
                         post["post_id"],
                         datetime.now(timezone.utc).isoformat())
@@ -825,7 +907,7 @@ def run_once(store: PostStore, dry_run: bool = False,
             post = {"post_id": pid, "handle": handle, "published_at": pub,
                     "text": text, "has_image": bool(img)}
             cls = Classification(cls_label, json.loads(lv or "[]"), [])
-            if tg_send(format_push(post, cls)):
+            if push_post(post, cls):
                 store.mark_pushed(pid, datetime.now(timezone.utc).isoformat())
                 result["pushed"] += 1
                 log(f"补发成功 @{handle} {pub[:16]}")
@@ -1125,11 +1207,10 @@ def push_latest(store: PostStore, per_account: int = 1, dry_run: bool = False,
             post = {"post_id": pid, "handle": handle, "published_at": pub,
                     "text": text, "has_image": bool(img)}
             cls = Classification(cls_label, json.loads(lv or "[]"), [])
-            msg = format_push(post, cls)
             if dry_run:
-                log(f"—— dry-run 应推送 ——\n{msg}")
+                log(f"—— dry-run 应推送 ——\n{format_push_plain(post, cls)}")
                 n += 1
-            elif tg_send(msg):
+            elif push_post(post, cls):
                 store.mark_pushed(pid, datetime.now(timezone.utc).isoformat())
                 n += 1
                 time.sleep(1.0)                               # 避开 TG 频率限制

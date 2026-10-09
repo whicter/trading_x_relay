@@ -256,6 +256,117 @@ class PushGatingTest(unittest.TestCase):
         self.assertIn("帖内含图", msg)
 
 
+class PushFormatTest(unittest.TestCase):
+    """2026-10-08：推送改用 Telegram HTML 排版，旧纯文本格式留作兜底。"""
+
+    @staticmethod
+    def _post(**kw):
+        p = {"post_id": "2108294463676113366", "handle": "novicetrader888",
+             "published_at": "2026-10-08T20:32:00.000Z", "has_image": False,
+             "text": "我感觉明天也许先涨后跌？要是再一次回测6800就好了。"}
+        p.update(kw)
+        return p
+
+    def test_layout(self):
+        msg = x_relay.format_push(self._post(), classify_post("回测6800", assume_index=True))
+        lines = msg.split("\n")
+        self.assertIn('<a href="https://x.com/novicetrader888">@novicetrader888</a>', lines[0],
+                      "账号必须链到 X 主页——裸 @ 会被 TG 当成 TG 用户名")
+        self.assertIn("#指数点位", lines[0])
+        self.assertEqual(lines[1], '10-08 16:32 ET · <a href="https://x.com/novicetrader888'
+                                   '/status/2108294463676113366">原帖 ↗</a>')
+        self.assertTrue(lines[2].startswith("<blockquote>"))
+        self.assertIn("<code>6,800</code>", msg)
+        self.assertNotIn("🔗", msg, "原帖链接已收进第二行")
+
+    def test_long_body_folds(self):
+        msg = x_relay.format_push(self._post(text="x" * 400), classify_post("x"))
+        self.assertIn("<blockquote expandable>", msg)
+        short = x_relay.format_push(self._post(text="x" * 50), classify_post("x"))
+        self.assertNotIn("expandable", short)
+
+    def test_entities_unescaped_then_escaped(self):
+        """X 存的是 `S&amp;P`：推送曾原样显示 `S&amp;P`。还原后再按 HTML 转义一次。"""
+        post = self._post(text="beat the S&amp;P 500 &lt;3 a<b")
+        msg = x_relay.format_push(post, classify_post(post["text"]))
+        self.assertIn("S&amp;P 500 &lt;3 a&lt;b", msg)
+        self.assertNotIn("&amp;amp;", msg)
+        plain = x_relay.format_push_plain(post, classify_post(post["text"]))
+        self.assertIn("S&P 500 <3 a<b", plain, "纯文本兜底不转义，但要还原实体")
+
+    def test_tco_links_dropped(self):
+        post = self._post(text="$GOOGL https://t.co/gQsPQ02sTI")
+        cls = classify_post(post["text"])
+        self.assertNotIn("t.co", x_relay.format_push(post, cls))
+        self.assertNotIn("t.co", x_relay.format_push_plain(post, cls))
+
+    def test_image_only_post_has_no_empty_quote(self):
+        post = self._post(text="https://t.co/abc", has_image=True)
+        msg = x_relay.format_push(post, classify_post(post["text"]))
+        self.assertNotIn("<blockquote", msg)
+        self.assertIn("帖内含图", msg)
+
+    def test_ticker_levels_bound(self):
+        text = "$MU key today is to take 1083 key resistance"
+        msg = x_relay.format_push(self._post(text=text), classify_post(text))
+        self.assertIn("<b>$MU</b> <code>1,083</code>", msg)
+
+    def test_every_class_has_chinese_name(self):
+        for label in ("index_levels", "index_view", "stock", "commodity",
+                      "crypto", "macro", "other"):
+            self.assertIn(label, x_relay.CLASS_CN)
+
+
+class TgSendFallbackTest(unittest.TestCase):
+    """HTML 被拒收（400）必须立刻改发纯文本：格式错误重试多少次都一样错，
+    留给重试队列只会把这条帖耗到"已放弃"。"""
+
+    def setUp(self):
+        self.calls = []
+        self._saved = (x_relay.resolve_tg, x_relay.urllib.request.urlopen, x_relay.log)
+        x_relay.resolve_tg = lambda: ("tok", "chat")
+        x_relay.log = lambda *a, **k: None
+
+    def tearDown(self):
+        x_relay.resolve_tg, x_relay.urllib.request.urlopen, x_relay.log = self._saved
+
+    def _urlopen(self, codes):
+        import urllib.error
+        import urllib.parse
+        seq = list(codes)
+
+        class Resp:
+            status = 200
+            def __enter__(self): return self
+            def __exit__(self, *a): return False
+
+        def fake(req, timeout=None):
+            self.calls.append(dict(urllib.parse.parse_qsl(req.data.decode())))
+            code = seq.pop(0)
+            if code != 200:
+                raise urllib.error.HTTPError(req.full_url, code, "x", {}, None)
+            return Resp()
+        x_relay.urllib.request.urlopen = fake
+
+    def test_html_rejected_falls_back_to_plain(self):
+        self._urlopen([400, 200])
+        self.assertTrue(x_relay.tg_send("<b>x", plain_fallback="x"))
+        self.assertEqual(self.calls[0].get("parse_mode"), "HTML")
+        self.assertNotIn("parse_mode", self.calls[1])
+        self.assertEqual(self.calls[1]["text"], "x")
+
+    def test_server_error_is_not_masked(self):
+        """5xx/限流不是格式问题：返回失败交给重试队列，不改发纯文本。"""
+        self._urlopen([500])
+        self.assertFalse(x_relay.tg_send("<b>x</b>", plain_fallback="x"))
+        self.assertEqual(len(self.calls), 1)
+
+    def test_alerts_stay_plain(self):
+        self._urlopen([200])
+        self.assertTrue(x_relay.tg_send("⚠️ 告警 <x>"))
+        self.assertNotIn("parse_mode", self.calls[0])
+
+
 class MicrodataExtractionTest(unittest.TestCase):
     """免登录微数据解析（2026-08-06 实测路线）的行为固定。"""
 
