@@ -2,22 +2,25 @@
 
 定位（quantrift_index_future/strategy_explore.md §A，2026-08-02 定稿；08-06 用户拍板施工）：
 **信息中继 + 决策支持，不是 alpha**。抓取指定博主的 X 帖子 → 启发式分类
-（指数分析 / 个股 / 其他）→ 全量落库（append-only）→ 只把指数类推送 Telegram。
+（指数/个股/商品/宏观…）→ 全量落库（append-only）→ 除噪音（promo/chatter/other）
+外全部推送 Telegram（2026-08-08 起黑名单口径）。
 
-**免登录**（2026-08-06 实测确定的路线）：X 未登录时 profile 页是降级渲染，
-但它带 **schema.org 微数据**（`itemprop=identifier/datePublished/articleBody/
-author/ImageObject`）——比登录后的 React DOM（`data-testid`）更干净也更稳定，
-因为那是给搜索引擎看的结构化数据。五个账号实测均可拿到最近 1-2 天的帖子。
-好处：无凭据、无账号封禁风险、无 session 过期、无 Google/X 登录反自动化拦截。
-代价：**每账号每轮只能看到约 5 条最新帖，且不能下滑加载更多**——靠按账号
-发帖率自适应的轮询覆盖（2026-10-08 前是一律 15 分钟）；`saturation` 检测负责在可能漏帖时显式告警（见 run_once）。
+**免登录抓取**：普通 HTTP GET 取 profile 页，解析服务端渲染进 HTML 的前端缓存
+（2026-08-19 起；X 拦死了浏览器指纹，见 `parse_rsc_posts` 上方）。09-24 起帖子
+搬进 GraphQL 流，两种解析器都保留，先 RSC 后 GraphQL。08-06..08-19 用的是
+浏览器 + schema.org 微数据，已停用（微数据抽取脚本、`extract_posts`、`--login`
+为当时遗留）。
+好处：无凭据、无账号封禁风险、无 session 过期、不开浏览器。
+代价：**每账号每次只能看到约 5 条最新帖（有置顶的实为 4 个新帖位），不能翻页**
+——靠按账号发帖率自适应的轮询覆盖（5-15 分钟，2026-10-08 起，见 PollScheduler）；
+gap 检测负责在可能漏帖时显式告警（见 run_once）。
 
 铁律（继承自主仓库讨论记录，不可放宽）：
 - X 内容是**不可信输入**：可推送、可入库打分，**绝不进入任何下单路径**。
   本服务不 import ib_insync、不占 clientId、不碰任何订单/仓位文件
   （tests/test_x_relay.py 的 AST 扫描强制此边界）。
-- **静默失败必须显性化**：页面结构失效（拿不到任何微数据）、连续整轮失败、
-  可能漏帖（saturation）都必须告警，不得静默返回空。
+- **静默失败必须显性化**：拿不到帖子（X 改版/被拦）、连续全灭、
+  可能漏帖（gap）都必须告警，不得静默返回空。
 - 定位是 4-8 周验证探针（回答「这些博主准不准」），不是长期管道；
   选择器脆弱是已接受的成本。
 
@@ -67,7 +70,7 @@ HEARTBEAT_DIR = Path(os.environ.get(
 ET = ZoneInfo("America/New_York")
 
 # 改前的固定轮询周期。2026-10-08 起轮询改为按账号自适应（见下方
-# PollScheduler），它仍是：失败重试上限、推送重试队列节奏、Mancini 的间隔上限。
+# PollScheduler），它仍是：所有账号的间隔上限（POLL_MAX_SECONDS）、推送重试队列节奏。
 POLL_SECONDS = 900
 PER_ACCOUNT_DELAY = (4.0, 9.0)     # 账号间随机停顿
 PUSH_MAX_AGE_HOURS = 12            # 只推这么久以内发布的帖（防首轮回填刷屏）
